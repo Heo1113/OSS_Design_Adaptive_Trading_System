@@ -15,7 +15,7 @@
 > **Project background, motivation, Goal, Target market etc.**
 
 * **Background & Motivation**: 암호화폐 선물 시장은 24시간 운영되며 변동성이 매우 큼. 기존의 정적인 자동 매매 시스템은 급변하는 시장 추세에 유연하게 대응하지 못해 수익성이 저하되는 한계가 있음.
-* **Goal**: 바이낸스(Binance) API를 활용해 실시간 데이터를 수집하고, **유전 알고리즘(Genetic Algorithm)**을 통해 매매 파라미터를 스스로 최적화하는 '지능형 적응 매매 엔진'을 구축한다.
+* **Goal**: 바이낸스(Binance) API를 활용해 실시간 데이터를 수집하고, **유전 알고리즘(Genetic Algorithm)**을 통해 매매 파라미터를 스스로 최적화하는 '지능형 적응 매매 엔진'을 구축함.
 * **Target market**: 감정을 배제한 데이터 기반 투자를 원하는 개인 투자자 및 시스템 트레이딩 개발자.
 
 ---
@@ -28,9 +28,9 @@
 
 #### [ Description for the terms ]
 * **System**: 유전 알고리즘 기반 최적화 엔진과 실시간 매매 실행 로직이 통합된 본 프로젝트의 핵심 시스템.
-* **User (Actor)**: API Key, 심볼, 레버리지 등 초기 설정값을 입력하고 시스템의 성과 리포트를 확인하는 주체임.
-* **Binance API (Actor)**: 실시간/과거 시세 데이터를 제공하고, 시스템의 주문 명령을 받아 체결 결과를 반환하는 외부 거래소 플랫폼임.
-* **TA Library (Actor)**: `pandas_ta` 등 오픈소스 라이브러리를 통해 시세 데이터를 분석하여 지표(ADX, Slope 등)를 제공함.
+* **User (Actor)**: API Key, 심볼, 레버리지 등 초기 설정값을 입력하고 시스템의 성과 리포트를 확인하는 주체.
+* **Binance API (Actor)**: 실시간/과거 시세 데이터를 제공하고, 시스템의 주문 명령을 받아 체결 결과를 반환하는 외부 거래소 플랫폼.
+* **TA Library (Actor)**: `pandas_ta` 등 오픈소스 라이브러리를 통해 시세 데이터를 분석하여 지표(ADX, Slope 등)를 제공.
 
 ---
 
