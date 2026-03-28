@@ -102,4 +102,4 @@
 ### 7. References
 
 * Binance API Documentation: https://binance-docs.github.io/apidocs/
-* Pandas-ta Library: https://github.com/twopirllc/pandas-ta(https://pypi.org/project/pandas-ta/ - 안 들어가질 시 참고 사항)
+* Pandas-ta Library: https://github.com/twopirllc/pandas-ta (https://pypi.org/project/pandas-ta/ - 안 들어가질 시 참고 사항)
