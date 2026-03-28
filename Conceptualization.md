@@ -86,4 +86,3 @@
 
 * Binance API Documentation: https://binance-docs.github.io/apidocs/
 * Pandas-ta Library: https://github.com/twopirllc/pandas-ta
-* [OSSDesign] intro_SRUP.pdf (Course Material)
