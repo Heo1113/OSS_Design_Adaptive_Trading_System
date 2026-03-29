@@ -328,7 +328,15 @@ if __name__ == "__main__":
             current_train_start = df_all['ts'].min()
             print(f"🆕 새로 시작")
 
-        OVERFIT_THRESHOLD = 0.3
+        # ── 채택 기준 (테스트 구간 절대 성과 기준) ──────────────────────────
+        # 비율 기준(test/train)을 쓰지 않는 이유:
+        #   GA는 항상 학습 구간을 최대한 과적합시키도록 설계되어 있어서
+        #   train ROI가 수천~수만%가 나오는 건 당연한 결과임
+        #   그 결과 test/train 비율은 구조적으로 항상 낮을 수밖에 없음
+        # → 테스트 구간 자체가 "쓸 만한가"를 절대 기준으로 판단
+        MIN_TEST_ROI    =  5.0   # 테스트 구간 최소 수익률 (%)
+        MAX_TEST_MDD    =  0.40  # 테스트 구간 최대 허용 MDD (40%)
+        MIN_TEST_TRADES =  10    # 테스트 구간 최소 거래 수
 
         while True:
             train_end = current_train_start + pd.Timedelta(days=TRAIN_DAYS)
@@ -362,18 +370,20 @@ if __name__ == "__main__":
             test_mdd    = test_result['MDD']
             test_trades = test_result['Trades']
 
-            # ── STEP 3: 과적합 비율 판정 (로그 스케일) ───────────────────────
-            if train_roi > 0:
-                log_train     = math.log1p(max(train_roi, 0) / 100)
-                log_test      = math.log1p(test_roi / 100) if test_roi > -100 else -1.0
-                overfit_ratio = log_test / (log_train + 1e-9)
-            else:
-                overfit_ratio = -1.0
+            # ── STEP 3: 테스트 구간 절대 성과 판정 ──────────────────────────
+            # 세 조건을 모두 통과해야 채택
+            # 1) 테스트 구간에서 수익이 났는가 (MIN_TEST_ROI 이상)
+            # 2) MDD가 허용 범위 안인가 (MAX_TEST_MDD 이하)
+            # 3) 거래가 충분히 있었는가 (MIN_TEST_TRADES 이상, 운에 의한 결과 방지)
+            reason = []
+            if test_roi   <  MIN_TEST_ROI:    reason.append(f"ROI {test_roi:.1f}% < {MIN_TEST_ROI}%")
+            if test_mdd   >  MAX_TEST_MDD:    reason.append(f"MDD {test_mdd*100:.1f}% > {MAX_TEST_MDD*100:.0f}%")
+            if test_trades < MIN_TEST_TRADES: reason.append(f"거래 {test_trades}회 < {MIN_TEST_TRADES}회")
 
-            is_accepted = overfit_ratio >= OVERFIT_THRESHOLD
-            status = "✅ 채택" if is_accepted else "❌ 기각"
+            is_accepted = len(reason) == 0
+            status = "✅ 채택" if is_accepted else f"❌ 기각 ({' / '.join(reason)})"
             print(f"   [테스트] ROI: {test_roi:.2f}% | MDD: {test_mdd*100:.1f}% | "
-                  f"Trades: {test_trades} | 과적합비율: {overfit_ratio:.3f} → {status}")
+                  f"Trades: {test_trades} → {status}")
 
             # ── STEP 4: OOS 누적 곡선 업데이트 ──────────────────────────────
             if test_trades > 0:
@@ -392,7 +402,6 @@ if __name__ == "__main__":
                 'test_roi'      : round(test_roi, 4),
                 'test_mdd'      : round(test_mdd, 4),
                 'test_trades'   : test_trades,
-                'overfit_ratio' : round(overfit_ratio, 4),
                 'is_accepted'   : is_accepted,
                 'oos_bal'       : round(oos_bal, 4),
                 'oos_mdd_cumul' : round(oos_mdd, 4),
@@ -406,12 +415,12 @@ if __name__ == "__main__":
             if is_accepted:
                 param_row = best_params.copy()
                 param_row.update({
-                    'win_idx'       : win_idx,
-                    'train_roi'     : round(train_roi, 4),
-                    'test_roi'      : round(test_roi, 4),
-                    'overfit_ratio' : round(overfit_ratio, 4),
-                    'start_date'    : current_train_start.date(),
-                    'end_date'      : train_end.date(),
+                    'win_idx'    : win_idx,
+                    'train_roi'  : round(train_roi, 4),
+                    'test_roi'   : round(test_roi, 4),
+                    'test_mdd'   : round(test_mdd, 4),
+                    'start_date' : current_train_start.date(),
+                    'end_date'   : train_end.date(),
                 })
                 param_df = pd.DataFrame([param_row])
                 param_df.to_csv(FILE_PARAMS, mode='a',
@@ -436,12 +445,12 @@ if __name__ == "__main__":
             print(f"   OOS 총 수익률: {df_oos['oos_bal'].iloc[-1] - 100:+.2f}%")
             print(f"   OOS 최대 낙폭: {df_oos['oos_mdd_cumul'].max()*100:.2f}%")
             print(f"\n📋 [윈도우별 요약]")
-            print(f"{'Win':>4} | {'Train ROI':>9} | {'Test ROI':>8} | {'OvFit':>6} | {'채택':>4} | OOS잔고")
+            print(f"{'Win':>4} | {'Train ROI':>9} | {'Test ROI':>8} | {'MDD':>6} | {'채택':>4} | OOS잔고")
             print("─" * 60)
             for _, r in df_oos.iterrows():
                 flag = "✅" if r['is_accepted'] else "❌"
                 print(f"  {int(r['window']):2d}  | {r['train_roi']:+8.2f}%  | {r['test_roi']:+7.2f}%  | "
-                      f"{r['overfit_ratio']:6.3f} | {flag}   | ${r['oos_bal']:,.2f}")
+                      f"{r['test_mdd']*100:5.1f}% | {flag}   | ${r['oos_bal']:,.2f}")
         print(f"\n💾 전체 결과: {FILE_OOS}")
         if os.path.exists(FILE_PARAMS):
             print(f"💾 채택 파라미터: {FILE_PARAMS}")
