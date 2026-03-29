@@ -18,7 +18,12 @@ BUFFER_DAYS = 60
 LEVERAGE = 5          
 
 TAKER_FEE = 0.0005
-SLIPPAGE = 0.001 
+SLIPPAGE = 0.001
+
+# 잔고 상한선: 이 값 이상으로 복리 증가를 허용하지 않음
+# 실전에서는 일정 수익 이후 포지션 크기를 고정하는 것과 동일한 효과
+# 100x 수익(10000%)을 넘으면 현실적으로 의미 없는 과최적화로 판단
+BAL_CAP = 10_000.0
 
 # WFA 전용 설정
 TRAIN_DAYS = 30     
@@ -32,35 +37,49 @@ MUTATION_RATE = 0.12
 ELITE_SIZE = 250       
 MDD_LIMIT = 0.40      
 
-# [2. 유전자 범위]
+# [2. 유전자 범위] — 탐색 공간 설계 의도
+# ┌─ 설계 원칙 ──────────────────────────────────────────────────────────────┐
+# │ r_sl_mult  : SL = r_sl_mult / atr_pct                                   │
+# │   → ATR 역비례 적응형 손절. 변동성 높으면 SL 좁고, 낮으면 SL 넓어짐    │
+# │ t_sl_base  : 추세 모드도 동일한 역비례 구조 (normal/strong 별도 유지)    │
+# │ RSI 분리   : normal/strong 별도 기준 → 추세 강도마다 다른 진입 필터     │
+# │ atr_inter  : ATR 계산 최적 타임프레임도 GA가 탐색                       │
+# └──────────────────────────────────────────────────────────────────────────┘
 GENE_BOUNDS = {
-    'r_adx_limit': (15.0, 35.0), 
-    't_adx_limit_normal': (20.0, 50.0), 
-    't_adx_limit_strong': (35.0, 65.0), 
-    'r_slope_max': (-5.0, 0.0),
-    't_slope_min': (1.0, 15.0),    
-    't_slope_strong': (3.0, 20.0),   
-    't_tp_short_mult': (1.2, 5.0),   
-    't_tp_mult': (4.0, 15.0),           
-    'r_tp_mult': (1.5, 4.5),            
-    'r_sl_mult': (0.0001, 0.01),        
-    't_sl_base_normal': (0.0001, 0.006), 
-    't_sl_base_strong': (0.0002, 0.012), 
-    't_ts_mult': (0.0001, 0.005),   
-    't_sl_activate': (0.01, 0.05),  
-    'r_vol_limit': (0.1, 2.0),    
-    't_vol_limit_normal': (0.1, 2.0),
-    't_vol_limit_strong': (0.5, 3.5),
-    'rsi_low': (30.0, 55.0),      
-    'rsi_high': (45.0, 70.0),     
-    't_rsi_max_normal': (60.0, 85.0), 
-    't_rsi_min_normal': (15.0, 40.0),
-    't_rsi_max_strong': (70.0, 95.0), 
-    't_rsi_min_strong': (10.0, 35.0)  
+    # ── 횡보(Range) ──────────────────────────────────────────────────────────
+    'r_adx_limit'        : (15.0, 35.0),
+    'r_slope_max'        : (-5.0,  0.0),
+    'r_tp_mult'          : ( 1.5,  4.5),
+    'r_sl_mult'          : (0.0001, 0.01),   # SL = r_sl_mult / atr_pct (역비례)
+    'r_vol_limit'        : ( 0.1,  2.0),
+    'rsi_low'            : (30.0, 55.0),
+    'rsi_high'           : (45.0, 70.0),
+
+    # ── 일반추세(Normal) ─────────────────────────────────────────────────────
+    't_adx_limit_normal' : (20.0, 50.0),
+    't_slope_min'        : ( 1.0, 15.0),
+    't_tp_short_mult'    : ( 1.2,  5.0),
+    't_vol_limit_normal' : ( 0.1,  2.0),
+    't_sl_base_normal'   : (0.0001, 0.006),  # SL = t_sl_base_normal / atr_pct
+    't_rsi_max_normal'   : (60.0, 85.0),     # 일반추세 롱 RSI 상한 (보수적)
+    't_rsi_min_normal'   : (15.0, 40.0),     # 일반추세 숏 RSI 하한 (보수적)
+
+    # ── 강한추세(Strong) ─────────────────────────────────────────────────────
+    't_adx_limit_strong' : (35.0, 65.0),
+    't_slope_strong'     : ( 3.0, 20.0),
+    't_tp_mult'          : ( 4.0, 15.0),
+    't_vol_limit_strong' : ( 0.5,  3.5),
+    't_sl_base_strong'   : (0.0002, 0.012),  # SL = t_sl_base_strong / atr_pct
+    't_rsi_max_strong'   : (70.0, 95.0),     # 강한추세 롱 RSI 상한 (더 허용적)
+    't_rsi_min_strong'   : (10.0, 35.0),     # 강한추세 숏 RSI 하한 (더 허용적)
+
+    # ── 트레일링 스탑 ────────────────────────────────────────────────────────
+    't_ts_mult'          : (0.0001, 0.005),
+    't_sl_activate'      : ( 0.01,  0.05),
 }
 
 INTERVALS = ['1h', '2h', '4h']
-TF_KEYS = ['r_inter', 't_inter_normal', 't_inter_strong', 'atr_inter']
+TF_KEYS   = ['r_inter', 't_inter_normal', 't_inter_strong', 'atr_inter']
 
 def get_data(symbol, interval, days):
     for i in range(3):
@@ -99,43 +118,64 @@ def prepare_full_data():
 def evaluate(args):
     ind_vals, df_main = args
     ind = ind_vals if isinstance(ind_vals, dict) else dict(zip(GENE_BOUNDS.keys(), ind_vals))
-    r_tf, tn_tf, ts_tf, atr_tf = ind.get('r_inter', '1h'), ind.get('t_inter_normal', '2h'), ind.get('t_inter_strong', '1h'), ind.get('atr_inter', '4h')
+    r_tf  = ind.get('r_inter',        '1h')
+    tn_tf = ind.get('t_inter_normal', '2h')
+    ts_tf = ind.get('t_inter_strong', '1h')
+    atr_tf = ind.get('atr_inter',     '4h')   # GA가 최적 ATR 타임프레임 탐색
     bal, peak, mdd, pos, pos_duration = 100.0, 100.0, 0.0, None, 0
     stats = {'range': {'wins': 0, 'trades': 0}, 'trend_normal': {'wins': 0, 'trades': 0}, 'trend_strong': {'wins': 0, 'trades': 0}, 'gross_p': 0.0, 'gross_l': 1e-9}
-    # 거래 수익률 기록: 피트니스 일관성 계산용 (한 방 대박 의존 파라미터 걸러내기 위함)
     trade_returns = []
 
     for row in df_main.itertuples():
         curr_p = row.close
         if pos is None:
             side, mode = None, None
-            # 횡보 및 추세 진입 로직
-            if getattr(row, f"adx_{r_tf}") < ind['r_adx_limit'] and getattr(row, f"adx_slope_{r_tf}") <= ind['r_slope_max'] and getattr(row, f"bbw_slope_{r_tf}") < 0:
+            # ── 횡보 진입 ───────────────────────────────────────────────────
+            if getattr(row, f"adx_{r_tf}") < ind['r_adx_limit'] and \
+               getattr(row, f"adx_slope_{r_tf}") <= ind['r_slope_max'] and \
+               getattr(row, f"bbw_slope_{r_tf}") < 0:
                 if row.vol > (row.vol_mean * ind['r_vol_limit']):
                     rsi_v, ma_v = getattr(row, f"rsi_{r_tf}"), getattr(row, f"ma20_{r_tf}")
-                    side = 'long' if (rsi_v < ind['rsi_low'] and curr_p < ma_v) else 'short' if (rsi_v > ind['rsi_high'] and curr_p > ma_v) else None
+                    side = 'long'  if (rsi_v < ind['rsi_low']  and curr_p < ma_v) else \
+                           'short' if (rsi_v > ind['rsi_high'] and curr_p > ma_v) else None
                     if side: mode = 'range'
+            # ── 강한추세 진입 ───────────────────────────────────────────────
             if not mode:
-                if getattr(row, f"adx_{ts_tf}") > ind['t_adx_limit_strong'] and getattr(row, f"adx_slope_{ts_tf}") >= ind['t_slope_strong']:
+                if getattr(row, f"adx_{ts_tf}") > ind['t_adx_limit_strong'] and \
+                   getattr(row, f"adx_slope_{ts_tf}") >= ind['t_slope_strong']:
                     if getattr(row, f"cum_vol_{ts_tf}") > (getattr(row, f"vol_{ts_tf}_mean") * ind['t_vol_limit_strong']):
                         rsi_v, ma_v = getattr(row, f"rsi_{ts_tf}"), getattr(row, f"ma20_{ts_tf}")
-                        side = 'long' if (curr_p > ma_v and rsi_v < ind['t_rsi_max_strong']) else 'short' if (curr_p < ma_v and rsi_v > ind['t_rsi_min_strong']) else None
+                        # 강한추세: RSI 기준 더 허용적 (극단까지 진입 가능)
+                        side = 'long'  if (curr_p > ma_v and rsi_v < ind['t_rsi_max_strong']) else \
+                               'short' if (curr_p < ma_v and rsi_v > ind['t_rsi_min_strong']) else None
                         if side: mode = 'trend_strong'
                 if not mode:
-                    if getattr(row, f"adx_{tn_tf}") > ind['t_adx_limit_normal'] and getattr(row, f"adx_slope_{tn_tf}") >= ind['t_slope_min']:
+                    if getattr(row, f"adx_{tn_tf}") > ind['t_adx_limit_normal'] and \
+                       getattr(row, f"adx_slope_{tn_tf}") >= ind['t_slope_min']:
                         if getattr(row, f"cum_vol_{tn_tf}") > (getattr(row, f"vol_{tn_tf}_mean") * ind['t_vol_limit_normal']):
                             rsi_v, ma_v = getattr(row, f"rsi_{tn_tf}"), getattr(row, f"ma20_{tn_tf}")
-                            side = 'long' if (curr_p > ma_v and rsi_v < ind['t_rsi_max_normal']) else 'short' if (curr_p < ma_v and rsi_v > ind['t_rsi_min_normal']) else None
+                            # 일반추세: RSI 기준 보수적 (과열 전 진입)
+                            side = 'long'  if (curr_p > ma_v and rsi_v < ind['t_rsi_max_normal']) else \
+                                   'short' if (curr_p < ma_v and rsi_v > ind['t_rsi_min_normal']) else None
                             if side: mode = 'trend_normal'
             if mode and side:
                 atr_pct = getattr(row, f"atr_{atr_tf}") / (curr_p + 1e-9)
-                pos_duration = 0 
+                pos_duration = 0
                 if mode == 'range':
-                    tp_pct, sl_pct = atr_pct * ind['r_tp_mult'], min(ind['r_sl_mult'] / (atr_pct + 1e-9), 0.02)
+                    tp_pct = atr_pct * ind['r_tp_mult']
+                    # ATR 역비례 적응형 손절: 변동성 높으면 SL 좁고, 낮으면 넓음
+                    sl_pct = min(ind['r_sl_mult'] / (atr_pct + 1e-9), 0.02)
+                elif mode == 'trend_strong':
+                    tp_pct = atr_pct * ind['t_tp_mult']
+                    sl_pct = min(ind['t_sl_base_strong'] / (atr_pct + 1e-9), 0.05)
+                else:  # trend_normal
+                    tp_pct = atr_pct * ind['t_tp_short_mult']
+                    sl_pct = min(ind['t_sl_base_normal'] / (atr_pct + 1e-9), 0.05)
+
+                if side == 'long':
+                    tp, sl = curr_p * (1 + tp_pct), curr_p * (1 - sl_pct)
                 else:
-                    sl_base, tp_mult = (ind['t_sl_base_strong'], ind['t_tp_mult']) if mode == 'trend_strong' else (ind['t_sl_base_normal'], ind['t_tp_short_mult'])
-                    tp_pct, sl_pct = atr_pct * tp_mult, min(sl_base / (atr_pct + 1e-9), 0.05)
-                tp, sl = (curr_p * (1 + tp_pct), curr_p * (1 - sl_pct)) if side == 'long' else (curr_p * (1 - tp_pct), curr_p * (1 + sl_pct))
+                    tp, sl = curr_p * (1 - tp_pct), curr_p * (1 + sl_pct)
                 pos = {'side': side, 'ent_p': curr_p, 'sl': sl, 'tp': tp, 'mode': mode}
         else:
             pos_duration += 1
@@ -168,9 +208,11 @@ def evaluate(args):
             elif (curr_p <= pos['sl'] if pos['side'] == 'long' else curr_p >= pos['sl']): is_exit, exit_p = True, pos['sl']
             elif (curr_p >= pos['tp'] if pos['side'] == 'long' else curr_p <= pos['tp']): is_exit, exit_p = True, pos['tp']
             if is_exit:
-                pnl = bal * (((exit_p - pos['ent_p'])/pos['ent_p'] if pos['side'] == 'long' else (pos['ent_p'] - exit_p)/pos['ent_p']) - (TAKER_FEE*2 + SLIPPAGE)) * LEVERAGE
+                # 잔고가 BAL_CAP 초과 시 실제 잔고의 10%만 포지션에 사용
+                # → 복리 폭발 방지 + 현실적인 리스크 관리 시뮬레이션
+                effective_bal = bal * 0.1 if bal > BAL_CAP else bal
+                pnl = effective_bal * (((exit_p - pos['ent_p'])/pos['ent_p'] if pos['side'] == 'long' else (pos['ent_p'] - exit_p)/pos['ent_p']) - (TAKER_FEE*2 + SLIPPAGE)) * LEVERAGE
                 bal += pnl
-                # [버그 수정] 잔고 변경 직후 peak/MDD 계산 (pos 초기화 전)
                 if bal > peak: peak = bal
                 mdd = max(mdd, (peak - bal) / (peak + 1e-9))
                 stats[pos['mode']]['trades'] += 1
@@ -187,7 +229,8 @@ def evaluate(args):
     # 기본 탈락 조건: 모드별 최소 5거래 미달 또는 MDD 초과
     # (기존 전체 5회 → 모드별 5회로 강화해서 3가지 전략이 모두 작동함을 보장)
     if r_tr < 5 or n_tr < 5 or s_tr < 5 or mdd > MDD_LIMIT:
-        return {'Fitness': -1000000.0, 'ROI': bal - 100, 'PF': 0.0, 'MDD': mdd, 'Trades': total_trades, **ind}
+        return {**ind,
+                'Fitness': -1000000.0, 'ROI': bal - 100, 'PF': 0.0, 'MDD': mdd, 'Trades': total_trades}
 
     pf = (stats['gross_p'] / stats['gross_l']) if stats['gross_l'] > 0 else 1.0
     roi = bal - 100
@@ -219,13 +262,16 @@ def evaluate(args):
         # 손실 구간: calmar만 사용해서 최소한의 순위 구분
         fitness = calmar * trade_weight
 
-    return {'Fitness': fitness, 'ROI': roi, 'PF': pf, 'MDD': mdd, 'Trades': total_trades,
-            'Calmar': round(calmar, 4), 'Consistency': round(consistency, 4), **ind}
+    return {**ind,   # 파라미터 먼저 → 아래 계산값이 덮어씀 (순서 중요)
+            'Fitness': fitness, 'ROI': roi, 'PF': pf, 'MDD': mdd, 'Trades': total_trades,
+            'Calmar': round(calmar, 4), 'Consistency': round(consistency, 4)}
     # ──────────────────────────────────────────────────────────────────────────
 
 # [4. GA 루프 (PATIENCE 추가)]
 def run_ga(df_train):
-    population = [{**{k: random.uniform(v[0], v[1]) for k, v in GENE_BOUNDS.items()}, **{tf: random.choice(INTERVALS) for tf in TF_KEYS}} for _ in range(POP_SIZE)]
+    population = [{**{k: random.uniform(v[0], v[1]) for k, v in GENE_BOUNDS.items()},
+                   **{tf: random.choice(INTERVALS) for tf in TF_KEYS}}
+                  for _ in range(POP_SIZE)]
     best_overall_fitness, no_improvement_count, best_individual = -float('inf'), 0, None
     
     for gen in range(GENERATIONS):
@@ -253,19 +299,38 @@ def run_ga(df_train):
     return best_individual
 
 if __name__ == "__main__":
+    import math, os
+
+    # ── 저장 파일 경로 ────────────────────────────────────────────────────────
+    FILE_PARAMS = "WFA_Params.csv"       # 채택된 파라미터 (윈도우마다 append)
+    FILE_OOS    = "WFA_OOS_Summary.csv"  # 전체 윈도우 요약 (윈도우마다 append)
+
     df_all = prepare_full_data()
     if df_all is not None:
-        current_train_start = df_all['ts'].min()
-        results_list = []
 
-        oos_bal      = 100.0   # OOS 누적 잔고 (100에서 시작)
-        oos_peak     = 100.0   # OOS 누적 최고 잔고
-        oos_mdd      = 0.0     # OOS 누적 MDD
-        oos_log      = []      # 윈도우별 OOS 요약 기록
+        # ── 이어쓰기 지원: 기존 파일에서 마지막 윈도우 번호와 OOS 상태 복원 ──
+        if os.path.exists(FILE_OOS):
+            prev = pd.read_csv(FILE_OOS)
+            win_idx  = int(prev['window'].max())
+            oos_bal  = float(prev['oos_bal'].iloc[-1])
+            oos_peak = float(prev['oos_bal'].max())
+            oos_mdd  = float(prev['oos_mdd_cumul'].iloc[-1]) if 'oos_mdd_cumul' in prev.columns else 0.0
+
+            # 마지막으로 완료된 윈도우의 test_end 다음 날부터 재시작
+            last_test_end = pd.to_datetime(prev['test_end'].iloc[-1])
+            # test_end = train_end + TEST_DAYS → train_start 역산
+            current_train_start = last_test_end - pd.Timedelta(days=TEST_DAYS_PER_WIN + TRAIN_DAYS - STEP_DAYS)
+            print(f"⏩ 기존 파일 발견 → 윈도우 {win_idx}부터 이어서 시작")
+        else:
+            win_idx  = 0
+            oos_bal  = 100.0
+            oos_peak = 100.0
+            oos_mdd  = 0.0
+            current_train_start = df_all['ts'].min()
+            print(f"🆕 새로 시작")
 
         OVERFIT_THRESHOLD = 0.3
 
-        win_idx = 0
         while True:
             train_end = current_train_start + pd.Timedelta(days=TRAIN_DAYS)
             test_end  = train_end + pd.Timedelta(days=TEST_DAYS_PER_WIN)
@@ -286,51 +351,44 @@ if __name__ == "__main__":
                 continue
 
             train_roi = best_params['ROI']
-            print(f"   [학습] ROI: {train_roi:.2f}% | MDD: {best_params['MDD']*100:.1f}% | "
+            print(f"   [학습] ROI: {min(train_roi, BAL_CAP-100):.2f}% | MDD: {best_params['MDD']*100:.1f}% | "
                   f"Calmar: {best_params.get('Calmar', 0):.3f} | "
                   f"Consistency: {best_params.get('Consistency', 0):.3f} | "
                   f"Trades: {best_params['Trades']}")
 
             # ── STEP 2: 테스트 구간 실전 평가 ────────────────────────────────
-            # 학습 파라미터를 한 번도 본 적 없는 기간에 그대로 적용
             df_test = df_all[(df_all['ts'] >= train_end) & (df_all['ts'] < test_end)]
             test_result = evaluate((best_params, df_test))
-
-            test_roi = test_result['ROI']
-            test_mdd = test_result['MDD']
+            test_roi    = test_result['ROI']
+            test_mdd    = test_result['MDD']
             test_trades = test_result['Trades']
 
-            # ── STEP 3: 과적합 비율 판정 ─────────────────────────────────────
-            # overfit_ratio: 1.0에 가까울수록 학습과 테스트 성과가 일치 (과적합 없음)
-            # 0에 가까우면 학습에서만 잘 됐고 실전에선 무너짐 (과적합)
-            # 음수면 학습은 흑자였는데 테스트는 적자
+            # ── STEP 3: 과적합 비율 판정 (로그 스케일) ───────────────────────
             if train_roi > 0:
-                overfit_ratio = test_roi / (train_roi + 1e-9)
+                log_train     = math.log1p(max(train_roi, 0) / 100)
+                log_test      = math.log1p(test_roi / 100) if test_roi > -100 else -1.0
+                overfit_ratio = log_test / (log_train + 1e-9)
             else:
-                # 학습 자체가 손실이면 테스트가 양호해도 채택하지 않음
                 overfit_ratio = -1.0
 
             is_accepted = overfit_ratio >= OVERFIT_THRESHOLD
-
-            status = "✅ 채택" if is_accepted else "❌ 기각 (과적합 의심)"
+            status = "✅ 채택" if is_accepted else "❌ 기각"
             print(f"   [테스트] ROI: {test_roi:.2f}% | MDD: {test_mdd*100:.1f}% | "
                   f"Trades: {test_trades} | 과적합비율: {overfit_ratio:.3f} → {status}")
 
             # ── STEP 4: OOS 누적 곡선 업데이트 ──────────────────────────────
-            # 채택 여부와 무관하게 OOS 곡선은 항상 기록
-            # (채택된 것만 기록하면 bias가 생겨 실전과 달라짐)
             if test_trades > 0:
-                # 테스트 ROI를 현재 OOS 잔고에 복리로 반영
-                test_growth = 1 + (test_roi / 100)
-                oos_bal  *= test_growth
+                oos_bal *= max(1 + test_roi / 100, 0)  # 음수 방지
                 if oos_bal > oos_peak: oos_peak = oos_bal
                 oos_mdd = max(oos_mdd, (oos_peak - oos_bal) / (oos_peak + 1e-9))
 
-            oos_log.append({
+            # ── STEP 5: 윈도우 완료 → 즉시 파일에 기록 ──────────────────────
+            # OOS 요약 한 줄 append
+            oos_row = pd.DataFrame([{
                 'window'        : win_idx,
-                'train_start'   : current_train_start,
-                'train_end'     : train_end,
-                'test_end'      : test_end,
+                'train_start'   : current_train_start.date(),
+                'train_end'     : train_end.date(),
+                'test_end'      : test_end.date(),
                 'train_roi'     : round(train_roi, 4),
                 'test_roi'      : round(test_roi, 4),
                 'test_mdd'      : round(test_mdd, 4),
@@ -338,50 +396,54 @@ if __name__ == "__main__":
                 'overfit_ratio' : round(overfit_ratio, 4),
                 'is_accepted'   : is_accepted,
                 'oos_bal'       : round(oos_bal, 4),
-            })
+                'oos_mdd_cumul' : round(oos_mdd, 4),
+            }])
+            # header=True는 파일이 없을 때만, 이후엔 header=False로 append
+            oos_row.to_csv(FILE_OOS, mode='a',
+                           header=not os.path.exists(FILE_OOS) or win_idx == 1,
+                           index=False, encoding='utf-8-sig')
 
-            # ── STEP 5: 채택된 파라미터만 저장 ──────────────────────────────
+            # 채택된 파라미터 append
             if is_accepted:
-                best_params['win_idx']       = win_idx
-                best_params['train_roi']     = round(train_roi, 4)
-                best_params['test_roi']      = round(test_roi, 4)
-                best_params['overfit_ratio'] = round(overfit_ratio, 4)
-                best_params['start_date']    = current_train_start
-                best_params['end_date']      = train_end
-                results_list.append(best_params)
+                param_row = best_params.copy()
+                param_row.update({
+                    'win_idx'       : win_idx,
+                    'train_roi'     : round(train_roi, 4),
+                    'test_roi'      : round(test_roi, 4),
+                    'overfit_ratio' : round(overfit_ratio, 4),
+                    'start_date'    : current_train_start.date(),
+                    'end_date'      : train_end.date(),
+                })
+                param_df = pd.DataFrame([param_row])
+                param_df.to_csv(FILE_PARAMS, mode='a',
+                                header=not os.path.exists(FILE_PARAMS),
+                                index=False, encoding='utf-8-sig')
+
+            print(f"   💾 저장 완료 → {FILE_OOS}"
+                  + (f" / {FILE_PARAMS}" if is_accepted else ""))
 
             current_train_start += pd.Timedelta(days=STEP_DAYS)
 
         # ── 최종 리포트 ───────────────────────────────────────────────────────
         print(f"\n{'='*60}")
-        print(f"🏁 WFA 완료 | 총 {win_idx}개 윈도우 | 채택: {len(results_list)}개")
-        print(f"\n📈 [OOS 누적 성과] (모든 테스트 윈도우 이어붙임)")
-        print(f"   최종 OOS 잔고: ${oos_bal:,.2f}  (시작: $100.00)")
-        print(f"   OOS 총 수익률: {oos_bal - 100:+.2f}%")
-        print(f"   OOS 최대 낙폭: {oos_mdd*100:.2f}%")
-
-        if oos_log:
-            df_oos = pd.DataFrame(oos_log)
-            accepted_rate = df_oos['is_accepted'].mean() * 100
-            avg_overfit   = df_oos[df_oos['overfit_ratio'] > -1]['overfit_ratio'].mean()
-            print(f"   파라미터 채택률: {accepted_rate:.1f}%")
-            print(f"   평균 과적합 비율: {avg_overfit:.3f}  (1.0에 가까울수록 학습=실전)")
-
-            print(f"\n📋 [윈도우별 상세 요약]")
+        print(f"🏁 WFA 완료")
+        if os.path.exists(FILE_OOS):
+            df_oos = pd.read_csv(FILE_OOS)
+            total_wins = int(df_oos['window'].max())
+            accepted   = df_oos['is_accepted'].sum()
+            print(f"   총 {total_wins}개 윈도우 | 채택: {accepted}개 ({accepted/total_wins*100:.1f}%)")
+            print(f"\n📈 [OOS 누적 성과]")
+            print(f"   최종 OOS 잔고: ${df_oos['oos_bal'].iloc[-1]:,.2f}  (시작: $100.00)")
+            print(f"   OOS 총 수익률: {df_oos['oos_bal'].iloc[-1] - 100:+.2f}%")
+            print(f"   OOS 최대 낙폭: {df_oos['oos_mdd_cumul'].max()*100:.2f}%")
+            print(f"\n📋 [윈도우별 요약]")
             print(f"{'Win':>4} | {'Train ROI':>9} | {'Test ROI':>8} | {'OvFit':>6} | {'채택':>4} | OOS잔고")
             print("─" * 60)
-            for r in oos_log:
+            for _, r in df_oos.iterrows():
                 flag = "✅" if r['is_accepted'] else "❌"
-                print(f"  {r['window']:2d}  | {r['train_roi']:+8.2f}%  | {r['test_roi']:+7.2f}%  | "
+                print(f"  {int(r['window']):2d}  | {r['train_roi']:+8.2f}%  | {r['test_roi']:+7.2f}%  | "
                       f"{r['overfit_ratio']:6.3f} | {flag}   | ${r['oos_bal']:,.2f}")
-
-            # CSV 저장: 윈도우 요약
-            df_oos.to_csv("WFA_OOS_Summary.csv", index=False, encoding='utf-8-sig')
-            print(f"\n💾 OOS 요약 저장: WFA_OOS_Summary.csv")
-
-        if results_list:
-            final_df = pd.DataFrame(results_list)
-            final_df.to_csv("WFA_Defensive_Patience_Result.csv", index=False, encoding='utf-8-sig')
-            print(f"💾 채택 파라미터 저장: WFA_Defensive_Patience_Result.csv")
-
+        print(f"\n💾 전체 결과: {FILE_OOS}")
+        if os.path.exists(FILE_PARAMS):
+            print(f"💾 채택 파라미터: {FILE_PARAMS}")
         print("="*60)
