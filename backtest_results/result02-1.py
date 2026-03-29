@@ -25,37 +25,39 @@ BAL_CAP = 10_000.0
 
 # 최적 파라미터 (GA 결과값)
 BEST_PARAMS = {
-    'atr_inter'          : '4h',
-    'r_inter'            : '1h',
-    't_inter_normal'     : '2h',
-    't_inter_strong'     : '1h',
+    'r_adx_limit': 8.01,         # 매우 낮은 ADX (강한 박스권 지향)
+    'r_slope_max': -1.35,
+    'r_tp_mult': 3.73,
+    'r_sl_mult': 0.00012,
+    'r_vol_limit': 0.95,
+    'rsi_low': 53.35,
+    'rsi_high': 45.24,
 
-    'r_adx_limit'        : 16.13943736592201,
-    'r_slope_max'        : -4.259703666661831,
-    'r_tp_mult'          : 3.893441599360326,
-    'r_sl_mult'          : 0.003122766312846024,   # SL = r_sl_mult / atr_pct (역비례)
-    'r_vol_limit'        : 1.853066332260667,
-    'rsi_low'            : 43.01630308774784,
-    'rsi_high'           : 56.05399998656385,
+    # -- 일반 추세(Normal Trend) 모드 파라미터 --
+    't_adx_limit_normal': 20.00,
+    't_slope_min': 1.22,
+    't_tp_short_mult': 1.35,
+    't_vol_limit_normal': 0.10,
+    't_sl_base_normal': 0.00012,
+    't_rsi_max_normal': 81.19,
+    't_rsi_min_normal': 20.01,
 
-    't_adx_limit_normal' : 31.679565181294052,
-    't_slope_min'        : 7.551904278771893,
-    't_tp_short_mult'    : 2.341256962698056,
-    't_vol_limit_normal' : 0.10081741110141343,
-    't_sl_base_normal'   : 0.0031326157395832493,
-    't_rsi_max_normal'   : 83.89874062536252,
-    't_rsi_min_normal'   : 20.656348152090604,
+    # -- 강한 추세(Strong Trend) 모드 파라미터 --
+    't_adx_limit_strong': 35.88,
+    't_slope_strong': 3.36,
+    't_tp_mult': 12.76,          # 강한 추세에서 이익을 길게 가져감
+    't_vol_limit_strong': 0.80,
+    't_sl_base_strong': 0.00022,
+    't_rsi_max_strong': 75.43,
+    't_rsi_min_strong': 19.20,
 
-    't_adx_limit_strong' : 41.86776717844237,
-    't_slope_strong'     : 3.4816259409797956,
-    't_tp_mult'          : 5.713174777280339,
-    't_vol_limit_strong' : 1.6416286150845474,
-    't_sl_base_strong'   : 0.009242923943382062,
-    't_rsi_max_strong'   : 75.22066216212338,
-    't_rsi_min_strong'   : 10.468104719155058,
-
-    't_ts_mult'          : 0.000200006601282613,
-    't_sl_activate'      : 0.041353472258057536,
+    # -- 트레일링 스탑 및 타임프레임 --
+    't_ts_mult': 0.0012,
+    't_sl_activate': 0.011,      # 약 1.1% 수익 시 트레일링 가동
+    'r_inter': '2h',
+    't_inter_normal': '1h',
+    't_inter_strong': '4h',
+    'atr_inter': '4h'
 }
 
 def get_data(symbol, interval, days):
@@ -242,8 +244,8 @@ if __name__ == "__main__":
                 df_main[f'cum_vol_{tf}'] = df_main.groupby(df_main['ts'].dt.floor(floor_freq))['vol'].transform('cumsum')
 
         df_ready = df_main[df_main['ts'] >= (df_main['ts'].max() - pd.Timedelta(days=TEST_DAYS))].dropna().reset_index(drop=True)
-        final_bal, logs, mode_stats, peak_bal, max_dd = run_backtest(df_ready, BEST_PARAMS)
-        
+        final_bal, logs, mode_stats, peak_bal, max_dd, _ = run_backtest(df_ready, BEST_PARAMS)
+
         all_modes = ['range', 'trend_normal', 'trend_strong']
         total_trades = sum(mode_stats[m]['trades'] for m in all_modes)
         total_wins = sum(mode_stats[m]['wins'] for m in all_modes)
