@@ -38,43 +38,63 @@ MDD_LIMIT = 0.40
 
 # [2. 유전자 범위] — 탐색 공간 설계 의도
 # ┌─ 설계 원칙 ──────────────────────────────────────────────────────────────┐
-# │ r_sl_mult  : SL = r_sl_mult / atr_pct                                   │
-# │   → ATR 역비례 적응형 손절. 변동성 높으면 SL 좁고, 낮으면 SL 넓어짐    │
+# │ r_sl_mult  : SL = r_sl_mult / atr_pct (ATR 역비례 적응형 손절)          │
 # │ t_sl_base  : 추세 모드도 동일한 역비례 구조 (normal/strong 별도 유지)    │
 # │ RSI 분리   : normal/strong 별도 기준 → 추세 강도마다 다른 진입 필터     │
 # │ atr_inter  : ATR 계산 최적 타임프레임도 GA가 탐색                       │
 # └──────────────────────────────────────────────────────────────────────────┘
+# ┌─ WFA 분석 기반 조정 사항 (2025-03-30) ───────────────────────────────────┐
+# │ [문제1] t_adx_limit_normal, t_slope_min, t_vol_limit_normal이 범위 최솟  │
+# │   값에 수렴 → 진입 조건 사실상 없음, 하루 25~37회 과다 거래 발생         │
+# │   → 하한을 높여서 진입 빈도를 하루 3~8회 수준으로 낮춤                  │
+# │ [문제2] r_slope_max ≈ 0 수렴 → 어떤 구간이든 횡보로 판정               │
+# │   → 범위를 (-4.0, -0.5)로 변경해 실질적 ADX 하강 구간만 허용            │
+# │ [문제3] rsi_low/rsi_high 간격 ≈ 0~3pt → RSI 필터 무력화                │
+# │   → rsi_low 상한 낮추고 rsi_high 하한 높여서 최소 15pt 간격 보장         │
+# └──────────────────────────────────────────────────────────────────────────┘
 GENE_BOUNDS = {
     # ── 횡보(Range) ──────────────────────────────────────────────────────────
     'r_adx_limit'        : (15.0, 35.0),
-    'r_slope_max'        : (-5.0,  0.0),
+    'r_slope_max'        : (-4.0, -0.5),  # [조정] 0에 수렴 방지 → 실질적 ADX 하강만 허용
     'r_tp_mult'          : ( 1.5,  4.5),
-    'r_sl_mult'          : (0.0001, 0.01),   # SL = r_sl_mult / atr_pct (역비례)
-    'r_vol_limit'        : ( 0.1,  2.0),
-    'rsi_low'            : (30.0, 55.0),
-    'rsi_high'           : (45.0, 70.0),
+    'r_sl_mult'          : (0.001, 0.01), # [조정] 하한 상향 (0.0001→0.001): 손절이 너무 좁으면 노이즈에 털림
+    'r_vol_limit'        : ( 0.3,  2.0),  # [조정] 하한 상향 (0.1→0.3): 최솟값 수렴 방지
+    'rsi_low'            : (25.0, 42.0),  # [조정] 상한 낮춤 (55→42): rsi_high와 간격 확보
+    'rsi_high'           : (58.0, 75.0),  # [조정] 하한 높임 (45→58): rsi_low와 최소 16pt 간격
 
     # ── 일반추세(Normal) ─────────────────────────────────────────────────────
-    't_adx_limit_normal' : (20.0, 50.0),
-    't_slope_min'        : ( 1.0, 15.0),
-    't_tp_short_mult'    : ( 1.2,  5.0),
-    't_vol_limit_normal' : ( 0.1,  2.0),
-    't_sl_base_normal'   : (0.0001, 0.006),  # SL = t_sl_base_normal / atr_pct
-    't_rsi_max_normal'   : (60.0, 85.0),     # 일반추세 롱 RSI 상한 (보수적)
-    't_rsi_min_normal'   : (15.0, 40.0),     # 일반추세 숏 RSI 하한 (보수적)
+    't_adx_limit_normal' : (25.0, 50.0),  # [조정] 하한 상향 (20→25): 진입 조건 강화
+    't_slope_min'        : ( 2.0, 15.0),  # [조정] 하한 상향 (1.0→2.0): slope 1% 미만은 추세 아님
+    't_tp_short_mult'    : ( 1.5,  5.0),  # [조정] 하한 상향 (1.2→1.5): RR비 최소 보장
+    't_vol_limit_normal' : ( 0.3,  2.0),  # [조정] 하한 상향 (0.1→0.3): 볼륨 필터 실질화
+    't_sl_base_normal'   : (0.001, 0.006),# [조정] 하한 상향 (0.0001→0.001): 손절 최솟값 보장
+    't_rsi_max_normal'   : (60.0, 85.0),
+    't_rsi_min_normal'   : (15.0, 40.0),
 
     # ── 강한추세(Strong) ─────────────────────────────────────────────────────
     't_adx_limit_strong' : (35.0, 65.0),
     't_slope_strong'     : ( 3.0, 20.0),
     't_tp_mult'          : ( 4.0, 15.0),
     't_vol_limit_strong' : ( 0.5,  3.5),
-    't_sl_base_strong'   : (0.0002, 0.012),  # SL = t_sl_base_strong / atr_pct
-    't_rsi_max_strong'   : (70.0, 95.0),     # 강한추세 롱 RSI 상한 (더 허용적)
-    't_rsi_min_strong'   : (10.0, 35.0),     # 강한추세 숏 RSI 하한 (더 허용적)
+    't_sl_base_strong'   : (0.002, 0.012),# [조정] 하한 상향 (0.0002→0.002)
+    't_rsi_max_strong'   : (70.0, 95.0),
+    't_rsi_min_strong'   : (15.0, 35.0),  # [조정] 하한 상향 (10→15): 극단값 수렴 방지
 
     # ── 트레일링 스탑 ────────────────────────────────────────────────────────
     't_ts_mult'          : (0.0001, 0.005),
     't_sl_activate'      : ( 0.01,  0.05),
+
+    # ── 롱/숏 비대칭 볼륨 로직 ──────────────────────────────────────────────
+    # 숏 진입 볼륨 기준 = 롱 기준 × t_vol_short_ratio
+    # 밈 코인 숏은 거래량 없이 흘러내리는 "원웨이 하락"을 잡아야 하므로
+    # 롱(FOMO 폭발 필요)보다 낮은 볼륨 기준을 허용
+    't_vol_short_ratio'  : ( 0.1,  0.9),
+
+    # ── 데드캣 바운스 조기 청산 (숏 전용) ───────────────────────────────────
+    # 숏 보유 중 "초록 봉 + 볼륨 스파이크" = 추세 전환 경보 → 즉시 청산
+    # 3분봉 거래량이 평균의 N배 이상이고 양봉이면 강제 청산
+    # 범위: 1.5(예민) ~ 6.0(둔감). 낮을수록 조기 청산 빈도 높아짐
+    't_short_vol_exit'   : ( 1.5,  6.0),
 }
 
 INTERVALS = ['1h', '2h', '4h']
@@ -95,32 +115,73 @@ def prepare_full_data():
     print(f"🔄 {SYMBOL} 데이터 로딩 및 지표 계산...")
     df_raw = get_data(SYMBOL, '3m', TOTAL_DAYS + BUFFER_DAYS)
     if df_raw.empty: return None
+    
     df_raw['vol_mean'] = df_raw['vol'].rolling(20).mean()
+    # [수정] 3분봉 자체의 14개 봉 기준 RSI를 계산합니다.
+    df_raw['rsi_3m'] = ta.rsi(df_raw['close'], length=14)
+    # 3분봉 상대거래량 (RVOL): 데드캣 바운스 감지에 사용
+    # vol_mean이 0인 초기 구간 방지
+    df_raw['rvol_3m'] = df_raw['vol'] / (df_raw['vol_mean'] + 1e-9)
     for tf in INTERVALS:
-        multiplier = 20 if tf == '1h' else 40 if tf == '2h' else 80
-        df_raw[f'ma20_{tf}'] = ta.sma(df_raw['close'], length=20 * multiplier)
         df_tf = get_data(SYMBOL, tf, TOTAL_DAYS + BUFFER_DAYS)
         if not df_tf.empty:
-            adx_series = ta.adx(df_tf['high'], df_tf['low'], df_tf['close'])['ADX_14']
-            df_tf[f'adx_{tf}'] = adx_series
-            df_tf[f'adx_slope_{tf}'] = adx_series.pct_change() * 100
-            df_tf[f'atr_{tf}'] = ta.atr(df_tf['high'], df_tf['low'], df_tf['close'], length=14)
-            df_tf[f'rsi_{tf}'] = ta.rsi(df_tf['close'], length=14)
-            df_tf[f'vol_{tf}_mean'] = df_tf['vol'].rolling(20).mean()
+            # ma20: 3분봉 근사(multiplier) 방식 제거 →
+            # 실제 TF 봉 기준으로 계산해서 result02-1.py와 동일한 값 사용
+            df_tf[f'ma20_{tf}']       = ta.sma(df_tf['close'], length=20)
+            adx_series                = ta.adx(df_tf['high'], df_tf['low'], df_tf['close'])['ADX_14']
+            df_tf[f'adx_{tf}']        = adx_series
+            df_tf[f'adx_slope_{tf}']  = adx_series.pct_change() * 100
+            df_tf[f'atr_{tf}']        = ta.atr(df_tf['high'], df_tf['low'], df_tf['close'], length=14)
+            df_tf[f'rsi_{tf}']        = ta.rsi(df_tf['close'], length=14)
+            df_tf[f'vol_{tf}_mean']   = df_tf['vol'].rolling(20).mean()
             bb = ta.bbands(df_tf['close'], length=20, std=2.0)
-            df_tf[f'bbw_{tf}'] = (bb.iloc[:, 2] - bb.iloc[:, 0]) / (bb.iloc[:, 1] + 1e-9)
-            df_tf[f'bbw_slope_{tf}'] = df_tf[f'bbw_{tf}'].pct_change() * 100
-            df_raw = pd.merge_asof(df_raw.sort_values('ts'), df_tf[['ts', f'adx_{tf}', f'adx_slope_{tf}', f'atr_{tf}', f'rsi_{tf}', f'vol_{tf}_mean', f'bbw_{tf}', f'bbw_slope_{tf}']].sort_values('ts'), on='ts', direction='backward')
-            df_raw[f'cum_vol_{tf}'] = df_raw.groupby(df_raw['ts'].dt.floor(tf.lower().replace('m', 'min')))['vol'].transform('cumsum')
+            df_tf[f'bbw_{tf}']        = (bb.iloc[:, 2] - bb.iloc[:, 0]) / (bb.iloc[:, 1] + 1e-9)
+            df_tf[f'bbw_slope_{tf}']  = df_tf[f'bbw_{tf}'].pct_change() * 100
+            df_raw = pd.merge_asof(
+                df_raw.sort_values('ts'),
+                df_tf[['ts', f'ma20_{tf}', f'adx_{tf}', f'adx_slope_{tf}',
+                        f'atr_{tf}', f'rsi_{tf}', f'vol_{tf}_mean',
+                        f'bbw_{tf}', f'bbw_slope_{tf}']].sort_values('ts'),
+                on='ts', direction='backward'
+            )
+            df_raw[f'cum_vol_{tf}'] = df_raw.groupby(
+                df_raw['ts'].dt.floor(tf.lower().replace('m', 'min'))
+            )['vol'].transform('cumsum')
     return df_raw.dropna().reset_index(drop=True)
 
 def evaluate(args):
     ind_vals, df_main = args
     ind = ind_vals if isinstance(ind_vals, dict) else dict(zip(GENE_BOUNDS.keys(), ind_vals))
-    r_tf  = ind.get('r_inter',        '1h')
-    tn_tf = ind.get('t_inter_normal', '2h')
-    ts_tf = ind.get('t_inter_strong', '1h')
-    atr_tf = ind.get('atr_inter',     '4h')   # GA가 최적 ATR 타임프레임 탐색
+
+    # ── 파라미터 논리 보정 ───────────────────────────────────────────────────
+    # 1) RSI 역전 보정 + 최소 간격 보장 (WFA 분석: 간격 0~3pt → 필터 무력화)
+    if ind['rsi_low'] >= ind['rsi_high']:
+        ind['rsi_low'], ind['rsi_high'] = ind['rsi_high'] - 5, ind['rsi_low'] + 5
+    # 간격이 10pt 미만이면 양쪽으로 벌림
+    gap = ind['rsi_high'] - ind['rsi_low']
+    if gap < 10:
+        mid = (ind['rsi_low'] + ind['rsi_high']) / 2
+        ind['rsi_low']  = max(25.0, mid - 8)
+        ind['rsi_high'] = min(75.0, mid + 8)
+
+    # 2) ADX/slope 역전: normal > strong이 되는 문제
+    #    같은 TF를 쓸 때만 같은 ADX 값을 두 기준으로 비교하므로 그때만 보정
+    r_tf   = ind.get('r_inter',        '1h')
+    tn_tf  = ind.get('t_inter_normal', '2h')
+    ts_tf  = ind.get('t_inter_strong', '1h')
+    atr_tf = ind.get('atr_inter',      '4h')
+
+    if tn_tf == ts_tf:
+        # 같은 TF: ADX 기준은 strong > normal 순서 유지
+        if ind['t_adx_limit_normal'] > ind['t_adx_limit_strong']:
+            ind['t_adx_limit_normal'], ind['t_adx_limit_strong'] = \
+                ind['t_adx_limit_strong'], ind['t_adx_limit_normal']
+        # slope도 strong >= normal 유지
+        if ind['t_slope_min'] > ind['t_slope_strong']:
+            ind['t_slope_min'], ind['t_slope_strong'] = \
+                ind['t_slope_strong'], ind['t_slope_min']
+    # ────────────────────────────────────────────────────────────────────────
+
     bal, peak, mdd, pos, pos_duration = 100.0, 100.0, 0.0, None, 0
     stats = {'range': {'wins': 0, 'trades': 0}, 'trend_normal': {'wins': 0, 'trades': 0}, 'trend_strong': {'wins': 0, 'trades': 0}, 'gross_p': 0.0, 'gross_l': 1e-9}
     trade_returns = []
@@ -134,7 +195,10 @@ def evaluate(args):
                getattr(row, f"adx_slope_{r_tf}") <= ind['r_slope_max'] and \
                getattr(row, f"bbw_slope_{r_tf}") < 0:
                 if row.vol > (row.vol_mean * ind['r_vol_limit']):
-                    rsi_v, ma_v = getattr(row, f"rsi_{r_tf}"), getattr(row, f"ma20_{r_tf}")
+                    # [수정] r_tf(1h)의 RSI가 아닌, 3분봉의 rsi_3m을 사용합니다.
+                    rsi_v = row.rsi_3m 
+                    ma_v = getattr(row, f"ma20_{r_tf}")
+                    
                     side = 'long'  if (rsi_v < ind['rsi_low']  and curr_p < ma_v) else \
                            'short' if (rsi_v > ind['rsi_high'] and curr_p > ma_v) else None
                     if side: mode = 'range'
@@ -142,21 +206,27 @@ def evaluate(args):
             if not mode:
                 if getattr(row, f"adx_{ts_tf}") > ind['t_adx_limit_strong'] and \
                    getattr(row, f"adx_slope_{ts_tf}") >= ind['t_slope_strong']:
-                    if getattr(row, f"cum_vol_{ts_tf}") > (getattr(row, f"vol_{ts_tf}_mean") * ind['t_vol_limit_strong']):
-                        rsi_v, ma_v = getattr(row, f"rsi_{ts_tf}"), getattr(row, f"ma20_{ts_tf}")
-                        # 강한추세: RSI 기준 더 허용적 (극단까지 진입 가능)
-                        side = 'long'  if (curr_p > ma_v and rsi_v < ind['t_rsi_max_strong']) else \
-                               'short' if (curr_p < ma_v and rsi_v > ind['t_rsi_min_strong']) else None
-                        if side: mode = 'trend_strong'
+                    rsi_v, ma_v = getattr(row, f"rsi_{ts_tf}"), getattr(row, f"ma20_{ts_tf}")
+                    # 롱/숏 비대칭 볼륨: 숏은 낮은 기준 허용 (원웨이 하락 포착)
+                    vol_base  = getattr(row, f"vol_{ts_tf}_mean") * ind['t_vol_limit_strong']
+                    vol_long  = getattr(row, f"cum_vol_{ts_tf}") > vol_base
+                    vol_short = getattr(row, f"cum_vol_{ts_tf}") > vol_base * ind['t_vol_short_ratio']
+                    if vol_long and curr_p > ma_v and rsi_v < ind['t_rsi_max_strong']:
+                        side, mode = 'long', 'trend_strong'
+                    elif vol_short and curr_p < ma_v and rsi_v > ind['t_rsi_min_strong']:
+                        side, mode = 'short', 'trend_strong'
                 if not mode:
                     if getattr(row, f"adx_{tn_tf}") > ind['t_adx_limit_normal'] and \
                        getattr(row, f"adx_slope_{tn_tf}") >= ind['t_slope_min']:
-                        if getattr(row, f"cum_vol_{tn_tf}") > (getattr(row, f"vol_{tn_tf}_mean") * ind['t_vol_limit_normal']):
-                            rsi_v, ma_v = getattr(row, f"rsi_{tn_tf}"), getattr(row, f"ma20_{tn_tf}")
-                            # 일반추세: RSI 기준 보수적 (과열 전 진입)
-                            side = 'long'  if (curr_p > ma_v and rsi_v < ind['t_rsi_max_normal']) else \
-                                   'short' if (curr_p < ma_v and rsi_v > ind['t_rsi_min_normal']) else None
-                            if side: mode = 'trend_normal'
+                        rsi_v, ma_v = getattr(row, f"rsi_{tn_tf}"), getattr(row, f"ma20_{tn_tf}")
+                        # 롱/숏 비대칭 볼륨
+                        vol_base  = getattr(row, f"vol_{tn_tf}_mean") * ind['t_vol_limit_normal']
+                        vol_long  = getattr(row, f"cum_vol_{tn_tf}") > vol_base
+                        vol_short = getattr(row, f"cum_vol_{tn_tf}") > vol_base * ind['t_vol_short_ratio']
+                        if vol_long and curr_p > ma_v and rsi_v < ind['t_rsi_max_normal']:
+                            side, mode = 'long', 'trend_normal'
+                        elif vol_short and curr_p < ma_v and rsi_v > ind['t_rsi_min_normal']:
+                            side, mode = 'short', 'trend_normal'
             if mode and side:
                 atr_pct = getattr(row, f"atr_{atr_tf}") / (curr_p + 1e-9)
                 pos_duration = 0
@@ -203,6 +273,17 @@ def evaluate(args):
                             pos['sl'] = trailing_sl
             # ────────────────────────────────────────────────────────────────────
 
+            # ─── 데드캣 바운스 조기 청산 (숏 전용) ──────────────────────────────
+            # 숏 보유 중 "3분봉 양봉 + 볼륨 스파이크" 감지 시 즉시 청산
+            # 조건: 양봉(close > open) AND 3분봉 RVOL > t_short_vol_exit
+            # 이유: 거래량 없이 하락하던 숏 흐름에서 갑자기 매수세가 들어오면
+            #       추세 전환 위험이 크므로 수익/손실 관계없이 탈출
+            if pos['mode'] != 'range' and pos['side'] == 'short':
+                is_green_candle = row.close > row.open
+                if is_green_candle and row.rvol_3m > ind['t_short_vol_exit']:
+                    is_exit = True  # SL/TP 체크보다 먼저 적용
+            # ────────────────────────────────────────────────────────────────────
+
             if pos['mode'] == 'range' and pos_duration >= 15: is_exit = True
             elif (curr_p <= pos['sl'] if pos['side'] == 'long' else curr_p >= pos['sl']): is_exit, exit_p = True, pos['sl']
             elif (curr_p >= pos['tp'] if pos['side'] == 'long' else curr_p <= pos['tp']): is_exit, exit_p = True, pos['tp']
@@ -233,7 +314,7 @@ def evaluate(args):
         any(0 < tr < 3 for tr in [r_tr, n_tr]) or   # range/normal: 0 또는 3회+
         (0 < s_tr < 2)                                # strong: 0 또는 2회+
     )
-    if total_trades < 15 or mode_invalid or mdd > MDD_LIMIT:
+    if total_trades < 10 or mode_invalid or mdd > MDD_LIMIT:
         return {**ind,
                 'Fitness': -1000000.0, 'ROI': bal - 100, 'PF': 0.0, 'MDD': mdd, 'Trades': total_trades}
 
@@ -342,7 +423,7 @@ if __name__ == "__main__":
         # → 테스트 구간 자체가 "쓸 만한가"를 절대 기준으로 판단
         MIN_TEST_ROI    =  5.0   # 테스트 구간 최소 수익률 (%)
         MAX_TEST_MDD    =  0.40  # 테스트 구간 최대 허용 MDD (40%)
-        MIN_TEST_TRADES =  10    # 테스트 구간 최소 거래 수
+        MIN_TEST_TRADES =  5    # 테스트 구간 최소 거래 수
 
         while True:
             train_end = current_train_start + pd.Timedelta(days=TRAIN_DAYS)
