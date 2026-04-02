@@ -2,543 +2,1040 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 from binance.client import Client
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 import warnings
 import random
 from multiprocessing import Pool, cpu_count
 import os
-import time
+from numba import njit
 
 warnings.filterwarnings('ignore')
 
-# [1. 설정 영역]
-client = Client("", "", {"verify": True, "timeout": 20}) 
-SYMBOL = 'FARTCOINUSDT'
-TOTAL_DAYS = 480      
-BUFFER_DAYS = 60      
-LEVERAGE = 5          
+# ─────────────────────────────────────────────
+# [1. 설정]
+# ─────────────────────────────────────────────
+client = Client("", "", {"verify": True, "timeout": 20})
+SYMBOL       = 'FARTCOINUSDT'
+TOTAL_DAYS   = 540
+BUFFER_DAYS  = 60
+LEVERAGE     = 5
+TAKER_FEE    = 0.0005
+SLIPPAGE     = 0.005
+BAL_CAP      = 10_000.0
 
-TAKER_FEE = 0.0005
-SLIPPAGE = 0.001
+TRAIN_DAYS        = 90
+TEST_DAYS_PER_WIN = 30
+STEP_DAYS         = 20
+PATIENCE          = 40
+POP_SIZE          = 8000
+GENERATIONS       = 150
+MUTATION_RATE     = 0.15
+ELITE_SIZE        = 200
+MDD_LIMIT         = 0.33
 
-# 포지션 축소 기준선: 잔고가 이 값을 넘으면 전체 잔고가 아닌 10%만 포지션에 사용
-# 잔고 자체는 계속 쌓임 — 포지션 크기만 줄여서 복리 폭발 속도를 억제
-BAL_CAP = 10_000.0
+# ─── 레짐 설정 ────────────────────────────────
+R_INTER_FIXED    = '1h'
+REGIME_SMA_SHORT = 960
+REGIME_KAMA_LEN  = 10
 
-# WFA 전용 설정
-TRAIN_DAYS = 30     
-TEST_DAYS_PER_WIN = 15 
-STEP_DAYS = 15         
-PATIENCE = 40
+# ─── 롤링 볼륨 윈도우 (3m 봉 기준 환산) ─────────
+TF_WINDOW = {'15m': 5, '1h': 20, '2h': 40, '4h': 80}
 
-POP_SIZE = 10000      
-GENERATIONS = 200     
-MUTATION_RATE = 0.12
-ELITE_SIZE = 250       
-MDD_LIMIT = 0.40      
+# ─── 클러스터링 설정 ───────────────────────────
+TOP_K_COLLECT   = 30
+MIN_CLUSTER_WIN = 3
+MAX_CLUSTERS    = 8
 
-# [2. 유전자 범위] — 탐색 공간 설계 의도
-# ┌─ 설계 원칙 ──────────────────────────────────────────────────────────────┐
-# │ r_sl_mult  : SL = r_sl_mult / atr_pct (ATR 역비례 적응형 손절)          │
-# │ t_sl_base  : 추세 모드도 동일한 역비례 구조 (normal/strong 별도 유지)    │
-# │ RSI 분리   : normal/strong 별도 기준 → 추세 강도마다 다른 진입 필터     │
-# │ atr_inter  : ATR 계산 최적 타임프레임도 GA가 탐색                       │
-# └──────────────────────────────────────────────────────────────────────────┘
-# ┌─ WFA 분석 기반 조정 사항 (2025-03-30) ───────────────────────────────────┐
-# │ [문제1] t_adx_limit_normal, t_slope_min, t_vol_limit_normal이 범위 최솟  │
-# │   값에 수렴 → 진입 조건 사실상 없음, 하루 25~37회 과다 거래 발생         │
-# │   → 하한을 높여서 진입 빈도를 하루 3~8회 수준으로 낮춤                  │
-# │ [문제2] r_slope_max ≈ 0 수렴 → 어떤 구간이든 횡보로 판정               │
-# │   → 범위를 (-4.0, -0.5)로 변경해 실질적 ADX 하강 구간만 허용            │
-# │ [문제3] rsi_low/rsi_high 간격 ≈ 0~3pt → RSI 필터 무력화                │
-# │   → rsi_low 상한 낮추고 rsi_high 하한 높여서 최소 15pt 간격 보장         │
-# └──────────────────────────────────────────────────────────────────────────┘
+# ─── OOS 채택 기준 ─────────────────────────────
+MIN_TEST_ROI    =  3.0    # v07: 5→3% 완화 (거래수 부족 문제 대응)
+MAX_TEST_MDD    =  0.35
+MIN_TEST_TRADES =  5      # v07: 10→5 완화 (OOS 거래수 부족 대응)
+
+# ─── 내부 IS/OOS 분리 비율 (안티-오버피팅) ────────
+IS_SPLIT_RATIO  = 0.70    # v07 신규: 학습 데이터 70% IS / 30% 내부검증
+
+# ─────────────────────────────────────────────
+# [2. 파라미터 범위]
+#
+# ★ v07 변경점:
+#   ① entry_tf 유전자: 1m vs 3m RSI/MFI 진입 신호 선택
+#   ② regime_thresh 유전자: 기존 하드코딩 1.0 → 탐색 가능
+#   ③ 횡보모드 진입: RSI AND MFI → RSI OR MFI (진입 빈도 증가)
+#   ④ Fitness 캡: ROI 80→40, Calmar 10→5 (오버피팅 억제)
+#   ⑤ 내부 IS/OOS 분리 Fitness (하모닉 평균): 과최적화 차단
+#   ⑥ Range 모드 SL 캡: 2%→5% (FARTCOIN 변동성 대응)
+#   ⑦ cooldown_max: 5→3 (연속 손실 후 재진입 빠르게)
+#   ⑧ _parse_result 최소 거래수: 10/20→3/8
+# ─────────────────────────────────────────────
 GENE_BOUNDS = {
-    # ── 횡보(Range) ──────────────────────────────────────────────────────────
-    'r_adx_limit'        : (15.0, 35.0),
-    'r_slope_max'        : (-4.0, -0.5),  # [조정] 0에 수렴 방지 → 실질적 ADX 하강만 허용
-    'r_tp_mult'          : ( 1.5,  4.5),
-    'r_sl_mult'          : (0.001, 0.01), # [조정] 하한 상향 (0.0001→0.001): 손절이 너무 좁으면 노이즈에 털림
-    'r_vol_limit'        : ( 0.3,  2.0),  # [조정] 하한 상향 (0.1→0.3): 최솟값 수렴 방지
-    'rsi_low'            : (25.0, 42.0),  # [조정] 상한 낮춤 (55→42): rsi_high와 간격 확보
-    'rsi_high'           : (58.0, 75.0),  # [조정] 하한 높임 (45→58): rsi_low와 최소 16pt 간격
+    # ── 횡보 모드 (mode 0) ──────────────────────
+    'r_adx_limit':    (10.0, 40.0),
+    'r_slope_max':    (-10.0, 0.0),
+    'r_chop_min':     (40.0, 70.0),
+    'r_vol_limit':    (0.1,  3.5),
+    'r_chop_15m_min': (40.0, 70.0),
+    'r_adx_15m_max':  (10.0, 35.0),
 
-    # ── 일반추세(Normal) ─────────────────────────────────────────────────────
-    't_adx_limit_normal' : (25.0, 50.0),  # [조정] 하한 상향 (20→25): 진입 조건 강화
-    't_slope_min'        : ( 2.0, 15.0),  # [조정] 하한 상향 (1.0→2.0): slope 1% 미만은 추세 아님
-    't_tp_short_mult'    : ( 1.5,  5.0),  # [조정] 하한 상향 (1.2→1.5): RR비 최소 보장
-    't_vol_limit_normal' : ( 0.3,  2.0),  # [조정] 하한 상향 (0.1→0.3): 볼륨 필터 실질화
-    't_sl_base_normal'   : (0.001, 0.006),# [조정] 하한 상향 (0.0001→0.001): 손절 최솟값 보장
-    't_rsi_max_normal'   : (60.0, 85.0),
-    't_rsi_min_normal'   : (15.0, 40.0),
+    # [1m/3m 진입 신호] — OR 조건 (AND → OR, v07 변경)
+    'rsi_low':        (15.0, 45.0),
+    'rsi_high':       (55.0, 85.0),
+    'r_mfi_low':      (10.0, 45.0),
+    'r_mfi_high':     (55.0, 90.0),
 
-    # ── 강한추세(Strong) ─────────────────────────────────────────────────────
-    't_adx_limit_strong' : (35.0, 65.0),
-    't_slope_strong'     : ( 3.0, 20.0),
-    't_tp_mult'          : ( 4.0, 15.0),
-    't_vol_limit_strong' : ( 0.5,  3.5),
-    't_sl_base_strong'   : (0.002, 0.012),# [조정] 하한 상향 (0.0002→0.002)
-    't_rsi_max_strong'   : (70.0, 95.0),
-    't_rsi_min_strong'   : (15.0, 35.0),  # [조정] 하한 상향 (10→15): 극단값 수렴 방지
+    # TP/SL
+    'r_tp_mult':      (0.1,  5.0),
+    'r_sl_mult':      (0.1,  4.0),
 
-    # ── 트레일링 스탑 ────────────────────────────────────────────────────────
-    't_ts_mult'          : (0.0001, 0.005),
-    't_sl_activate'      : ( 0.01,  0.05),
+    # ── 추세 모드 (mode 1/2) ────────────────────
+    't_adx_4h_min':   (15.0, 45.0),
+    't_chop_4h_max':  (30.0, 65.0),
+    't_slope_4h_min': (0.0,  5.0),
 
-    # ── 롱/숏 비대칭 볼륨 로직 ──────────────────────────────────────────────
-    # 숏 진입 볼륨 기준 = 롱 기준 × t_vol_short_ratio
-    # 밈 코인 숏은 거래량 없이 흘러내리는 "원웨이 하락"을 잡아야 하므로
-    # 롱(FOMO 폭발 필요)보다 낮은 볼륨 기준을 허용
-    't_vol_short_ratio'  : ( 0.1,  0.9),
+    't_macd_1h_thresh': (-0.01, 0.03),
 
-    # ── 데드캣 바운스 조기 청산 (숏 전용) ───────────────────────────────────
-    # 숏 보유 중 "초록 봉 + 볼륨 스파이크" = 추세 전환 경보 → 즉시 청산
-    # 3분봉 거래량이 평균의 N배 이상이고 양봉이면 강제 청산
-    # 범위: 1.5(예민) ~ 6.0(둔감). 낮을수록 조기 청산 빈도 높아짐
-    't_short_vol_exit'   : ( 1.5,  6.0),
+    't_vol_15m_ratio':  (0.1, 4.0),
+    't_adx_15m_min':    (10.0, 40.0),
+
+    't_rsi_max':      (50.0, 95.0),
+    't_rsi_min':      (5.0,  50.0),
+    't_mfi_max':      (50.0, 95.0),
+    't_mfi_min':      (5.0,  50.0),
+
+    't_adx_strong_thresh': (25.0, 55.0),
+
+    't_tp_normal_mult': (1.0, 6.0),
+    't_tp_strong_mult': (2.0, 10.0),
+    't_sl_normal':      (0.5, 5.0),
+    't_sl_strong':      (1.0, 6.0),
+
+    # ── 공통 청산 ───────────────────────────────
+    't_ts_mult':         (0.002, 0.03),
+    't_sl_activate':     (0.01,  0.1),
+    't_vol_short_ratio': (0.1,   2.0),
+    't_short_vol_exit':  (1.5,   8.0),
+
+    # ── v07 신규: 레짐 임계값 유전자 ───────────────
+    # 기존 하드코딩 1.0 → GA가 탐색하도록 변경
+    # 1.0 이하: 강세(상승추세), 이상: 약세
+    'regime_thresh':     (0.85, 1.15),
 }
 
-INTERVALS = ['1h', '2h', '4h']
-TF_KEYS   = ['r_inter', 't_inter_normal', 't_inter_strong', 'atr_inter']
+# v07: entry_tf 추가 (1m vs 3m RSI/MFI 진입 신호 선택)
+TF_KEYS        = ['atr_inter', 'entry_tf']
+TF_OPTIONS     = ['1h', '2h', '4h']          # atr_inter 옵션
+TF_OPTIONS_ENT = ['1m', '3m']                # entry_tf 옵션
 
-def get_data(symbol, interval, days):
-    for i in range(3):
-        try:
-            klines = client.futures_historical_klines(symbol, interval, f"{days} days ago UTC")
-            df = pd.DataFrame(klines, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'ct', 'qv', 'tr', 'tb', 'tq', 'ig'])
-            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-            df[['open', 'high', 'low', 'close', 'vol']] = df[['open', 'high', 'low', 'close', 'vol']].astype(float)
-            return df[['ts', 'open', 'high', 'low', 'close', 'vol']]
-        except: time.sleep(2)
-    return pd.DataFrame()
+_NUMERIC_KEYS = list(GENE_BOUNDS.keys())
+_BOUNDS_LO    = np.array([GENE_BOUNDS[k][0] for k in _NUMERIC_KEYS])
+_BOUNDS_HI    = np.array([GENE_BOUNDS[k][1] for k in _NUMERIC_KEYS])
 
-def prepare_full_data():
-    print(f"🔄 {SYMBOL} 데이터 로딩 및 지표 계산...")
+
+# ─────────────────────────────────────────────
+# [3. 데이터 로딩]
+# ─────────────────────────────────────────────
+def get_data(symbol: str, interval: str, days: int) -> pd.DataFrame:
+    try:
+        klines = client.futures_historical_klines(symbol, interval, f"{days} days ago UTC")
+        if not klines:
+            return pd.DataFrame()
+        df = pd.DataFrame(klines, columns=[
+            'ts','open','high','low','close','vol',
+            'close_time','qav','trades','tbbav','tbqav','ignore'
+        ])
+        df = df[['ts','open','high','low','close','vol']].astype(float)
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        return df.reset_index(drop=True)
+    except Exception as e:
+        print(f"  ⚠️ 데이터 오류 ({symbol} {interval}): {e}")
+        return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────
+# [4. 데이터 준비]
+#
+# ★ v07 변경점:
+#   - rsi_3m / mfi_3m 보존 (entry_tf='3m' 사용 시)
+#   - rsi_1m / mfi_1m (entry_tf='1m' 사용 시)
+#   - 나머지 지표 구조는 v06 동일
+# ─────────────────────────────────────────────
+def prepare_full_data() -> pd.DataFrame | None:
+    print(f"🔄 {SYMBOL} 데이터 로딩 중...")
     df_raw = get_data(SYMBOL, '3m', TOTAL_DAYS + BUFFER_DAYS)
-    if df_raw.empty: return None
-    
+    if df_raw.empty:
+        print("❌ 3분봉 데이터 로딩 실패")
+        return None
+
+    # ── 3m 기준봉 ───────────────────────────────
     df_raw['vol_mean'] = df_raw['vol'].rolling(20).mean()
-    # [수정] 3분봉 자체의 14개 봉 기준 RSI를 계산합니다.
-    df_raw['rsi_3m'] = ta.rsi(df_raw['close'], length=14)
-    # 3분봉 상대거래량 (RVOL): 데드캣 바운스 감지에 사용
-    # vol_mean이 0인 초기 구간 방지
-    df_raw['rvol_3m'] = df_raw['vol'] / (df_raw['vol_mean'] + 1e-9)
-    for tf in INTERVALS:
+    df_raw['rsi_3m']   = ta.rsi(df_raw['close'], length=14)
+    df_raw['mfi_3m']   = ta.mfi(df_raw['high'], df_raw['low'], df_raw['close'],
+                                 df_raw['vol'], length=14)
+
+    # ── 레짐 ────────────────────────────────────
+    df_raw['kama_fast']  = ta.kama(df_raw['close'], length=REGIME_KAMA_LEN)
+    df_raw['sma_short']  = ta.sma(df_raw['close'],  length=REGIME_SMA_SHORT)
+    df_raw['regime_str'] = (
+        df_raw['close'] / (df_raw['kama_fast'] + 1e-9) +
+        df_raw['close'] / (df_raw['sma_short']  + 1e-9)
+    ) / 2.0
+
+    # ── 고정 TF 지표 (1h / 2h / 4h) ─────────────
+    for tf in TF_OPTIONS:
         df_tf = get_data(SYMBOL, tf, TOTAL_DAYS + BUFFER_DAYS)
-        if not df_tf.empty:
-            # ma20: 3분봉 근사(multiplier) 방식 제거 →
-            # 실제 TF 봉 기준으로 계산해서 result02-1.py와 동일한 값 사용
-            df_tf[f'ma20_{tf}']       = ta.sma(df_tf['close'], length=20)
-            adx_series                = ta.adx(df_tf['high'], df_tf['low'], df_tf['close'])['ADX_14']
-            df_tf[f'adx_{tf}']        = adx_series
-            df_tf[f'adx_slope_{tf}']  = adx_series.pct_change() * 100
-            df_tf[f'atr_{tf}']        = ta.atr(df_tf['high'], df_tf['low'], df_tf['close'], length=14)
-            df_tf[f'rsi_{tf}']        = ta.rsi(df_tf['close'], length=14)
-            df_tf[f'vol_{tf}_mean']   = df_tf['vol'].rolling(20).mean()
-            bb = ta.bbands(df_tf['close'], length=20, std=2.0)
-            df_tf[f'bbw_{tf}']        = (bb.iloc[:, 2] - bb.iloc[:, 0]) / (bb.iloc[:, 1] + 1e-9)
-            df_tf[f'bbw_slope_{tf}']  = df_tf[f'bbw_{tf}'].pct_change() * 100
-            df_raw = pd.merge_asof(
-                df_raw.sort_values('ts'),
-                df_tf[['ts', f'ma20_{tf}', f'adx_{tf}', f'adx_slope_{tf}',
-                        f'atr_{tf}', f'rsi_{tf}', f'vol_{tf}_mean',
-                        f'bbw_{tf}', f'bbw_slope_{tf}']].sort_values('ts'),
-                on='ts', direction='backward'
-            )
-            df_raw[f'cum_vol_{tf}'] = df_raw.groupby(
-                df_raw['ts'].dt.floor(tf.lower().replace('m', 'min'))
-            )['vol'].transform('cumsum')
+        if df_tf.empty:
+            print(f"  ⚠️ {tf} 데이터 로딩 실패, 스킵")
+            continue
+
+        df_tf[f'ma20_{tf}']            = ta.sma(df_tf['close'], length=20)
+        adx_series                      = ta.adx(df_tf['high'], df_tf['low'], df_tf['close'])['ADX_14']
+        df_tf[f'adx_{tf}']             = ta.ema(adx_series, length=3)
+        df_tf[f'adx_slope_{tf}']       = ta.ema(adx_series.pct_change() * 100, length=3)
+        df_tf[f'atr_{tf}']             = ta.atr(df_tf['high'], df_tf['low'], df_tf['close'], length=14)
+        df_tf[f'rsi_{tf}']             = ta.rsi(df_tf['close'], length=14)
+        df_tf[f'vol_{tf}_mean']        = df_tf['vol'].rolling(20).mean()
+        df_tf[f'mfi_{tf}']             = ta.mfi(df_tf['high'], df_tf['low'],
+                                                 df_tf['close'], df_tf['vol'], length=14)
+        df_tf[f'chop_{tf}']            = ta.chop(df_tf['high'], df_tf['low'],
+                                                  df_tf['close'], length=14)
+        macd_df                         = ta.macd(df_tf['close'], fast=12, slow=26, signal=9)
+        df_tf[f'macd_hist_norm_{tf}']  = macd_df['MACDh_12_26_9'] / (df_tf['close'] + 1e-9)
+
+        window_size = TF_WINDOW.get(tf, 20)
+        df_raw[f'rolling_vol_{tf}'] = df_raw['vol'].rolling(window_size).sum()
+
+        df_raw = pd.merge_asof(
+            df_raw.sort_values('ts'),
+            df_tf.sort_values('ts'),
+            on='ts', direction='backward',
+            suffixes=('', f'_{tf}_tmp')
+        )
+
+    # ── 15m 데이터 ──────────────────────────────
+    df_15m = get_data(SYMBOL, '15m', TOTAL_DAYS + BUFFER_DAYS)
+    if not df_15m.empty:
+        df_15m['ma20_15m']     = ta.sma(df_15m['close'], length=20)
+        adx_15m_series          = ta.adx(df_15m['high'], df_15m['low'], df_15m['close'])['ADX_14']
+        df_15m['adx_15m']      = ta.ema(adx_15m_series, length=3)
+        df_15m['chop_15m']     = ta.chop(df_15m['high'], df_15m['low'],
+                                          df_15m['close'], length=14)
+        df_15m['vol_15m_mean'] = df_15m['vol'].rolling(20).mean()
+
+        df_raw['rolling_vol_15m'] = df_raw['vol'].rolling(TF_WINDOW['15m']).sum()
+
+        df_raw = pd.merge_asof(
+            df_raw.sort_values('ts'),
+            df_15m[['ts', 'ma20_15m', 'adx_15m', 'chop_15m', 'vol_15m_mean']].sort_values('ts'),
+            on='ts', direction='backward'
+        )
+        print("  ✅ 15m 데이터 로딩 완료")
+    else:
+        df_raw['ma20_15m']        = df_raw[f'ma20_{R_INTER_FIXED}']
+        df_raw['adx_15m']         = df_raw[f'adx_{R_INTER_FIXED}']
+        df_raw['chop_15m']        = df_raw[f'chop_{R_INTER_FIXED}']
+        df_raw['vol_15m_mean']    = df_raw['vol_mean']
+        df_raw['rolling_vol_15m'] = df_raw[f'rolling_vol_{R_INTER_FIXED}']
+        print("  ⚠️ 15m 데이터 로딩 실패 — 1h 지표로 대체")
+
+    # ── 1m 데이터 ───────────────────────────────
+    df_1m = get_data(SYMBOL, '1m', TOTAL_DAYS + BUFFER_DAYS)
+    if not df_1m.empty:
+        df_1m['rsi_1m'] = ta.rsi(df_1m['close'], length=14)
+        df_1m['mfi_1m'] = ta.mfi(df_1m['high'], df_1m['low'],
+                                  df_1m['close'], df_1m['vol'], length=14)
+        df_raw = pd.merge_asof(
+            df_raw.sort_values('ts'),
+            df_1m[['ts', 'rsi_1m', 'mfi_1m']].sort_values('ts'),
+            on='ts', direction='backward'
+        )
+        print("  ✅ 1m 데이터 로딩 완료")
+    else:
+        df_raw['rsi_1m'] = df_raw['rsi_3m']
+        df_raw['mfi_1m'] = df_raw['mfi_3m']
+        print("  ⚠️ 1m 데이터 로딩 실패 — 3m 지표로 대체")
+
     return df_raw.dropna().reset_index(drop=True)
 
-def evaluate(args):
-    ind_vals, df_main = args
-    ind = ind_vals if isinstance(ind_vals, dict) else dict(zip(GENE_BOUNDS.keys(), ind_vals))
 
-    # ── 파라미터 논리 보정 ───────────────────────────────────────────────────
-    # 1) RSI 역전 보정 + 최소 간격 보장 (WFA 분석: 간격 0~3pt → 필터 무력화)
-    if ind['rsi_low'] >= ind['rsi_high']:
-        ind['rsi_low'], ind['rsi_high'] = ind['rsi_high'] - 5, ind['rsi_low'] + 5
-    # 간격이 10pt 미만이면 양쪽으로 벌림
-    gap = ind['rsi_high'] - ind['rsi_low']
-    if gap < 10:
-        mid = (ind['rsi_low'] + ind['rsi_high']) / 2
-        ind['rsi_low']  = max(25.0, mid - 8)
-        ind['rsi_high'] = min(75.0, mid + 8)
+# ─────────────────────────────────────────────
+# [5. Numba 백테스트 코어]
+#
+# ★ v07 변경점:
+#   ① rsi_3m / mfi_3m 추가 파라미터
+#   ② use_1m 플래그: 1.0이면 1m 신호 사용, 0.0이면 3m 신호 사용
+#   ③ regime_thresh 파라미터 추가 (p_vals 마지막)
+#   ④ 횡보 진입: RSI AND MFI → RSI OR MFI
+#      (둘 중 하나만 충족해도 진입 → 거래 빈도 증가)
+#   ⑤ cooldown_max: 5→3
+#   ⑥ Range 모드 SL 캡: 0.02→0.05
+# ─────────────────────────────────────────────
+@njit(cache=True)
+def _run_backtest_core(
+    # ── 3m 기준봉 ────────────────────────────────
+    close, open_, vol, vol_mean,
+    # ── 1m 진입 신호 ─────────────────────────────
+    rsi_1m, mfi_1m,
+    # ── 3m 진입 신호 (v07 신규) ───────────────────
+    rsi_3m, mfi_3m,
+    # ── entry_tf 선택 플래그 (v07 신규) ───────────
+    # 1.0 = 1m 신호 사용, 0.0 = 3m 신호 사용
+    use_1m,
+    # ── 15m ──────────────────────────────────────
+    ma20_15m, adx_15m, chop_15m, vol_15m_mean, rolling_vol_15m,
+    # ── 1h ───────────────────────────────────────
+    adx_1h, adx_slope_1h, chop_1h, ma20_1h, macd_hist_1h,
+    # ── 4h ───────────────────────────────────────
+    adx_4h, adx_slope_4h, chop_4h,
+    # ── 공통 ─────────────────────────────────────
+    atr,
+    regime,
+    p_vals, lev, fee, slip, mdd_lim, b_cap
+):
+    # ── 파라미터 언패킹 (GENE_BOUNDS 순서와 일치) ──
+    (r_adx_limit, r_slope_max, r_chop_min, r_vol_limit,
+     r_chop_15m_min, r_adx_15m_max,
+     rsi_low, rsi_high, r_mfi_low, r_mfi_high,
+     r_tp_mult, r_sl_mult,
+     t_adx_4h_min, t_chop_4h_max, t_slope_4h_min,
+     t_macd_1h_thresh,
+     t_vol_15m_ratio, t_adx_15m_min,
+     t_rsi_max, t_rsi_min, t_mfi_max, t_mfi_min,
+     t_adx_strong_thresh,
+     t_tp_normal_mult, t_tp_strong_mult,
+     t_sl_normal, t_sl_strong,
+     t_ts_mult, t_sl_activate,
+     t_vol_short_ratio, t_short_vol_exit,
+     regime_thresh) = p_vals             # v07: regime_thresh 추가
 
-    # 2) ADX/slope 역전: normal > strong이 되는 문제
-    #    같은 TF를 쓸 때만 같은 ADX 값을 두 기준으로 비교하므로 그때만 보정
-    r_tf   = ind.get('r_inter',        '1h')
-    tn_tf  = ind.get('t_inter_normal', '2h')
-    ts_tf  = ind.get('t_inter_strong', '1h')
-    atr_tf = ind.get('atr_inter',      '4h')
+    cooldown_max   = 3    # v07: 5→3 (연속손실 후 재진입 빠르게)
+    consec_loss_th = 4    # v07: 3→4 (쿨다운 트리거 조금 느리게)
 
-    if tn_tf == ts_tf:
-        # 같은 TF: ADX 기준은 strong > normal 순서 유지
-        if ind['t_adx_limit_normal'] > ind['t_adx_limit_strong']:
-            ind['t_adx_limit_normal'], ind['t_adx_limit_strong'] = \
-                ind['t_adx_limit_strong'], ind['t_adx_limit_normal']
-        # slope도 strong >= normal 유지
-        if ind['t_slope_min'] > ind['t_slope_strong']:
-            ind['t_slope_min'], ind['t_slope_strong'] = \
-                ind['t_slope_strong'], ind['t_slope_min']
-    # ────────────────────────────────────────────────────────────────────────
+    bal   = 100.0; peak = 100.0; mdd = 0.0
+    in_pos = False; side = 0; mode = 0; ent_p = 0.0
+    sl = 0.0; tp = 0.0; dur = 0
+    ent_regime_scale = 1.0
+    tr_counts  = np.zeros(3)
+    trade_pnls = []
 
-    bal, peak, mdd, pos, pos_duration = 100.0, 100.0, 0.0, None, 0
-    stats = {'range': {'wins': 0, 'trades': 0}, 'trend_normal': {'wins': 0, 'trades': 0}, 'trend_strong': {'wins': 0, 'trades': 0}, 'gross_p': 0.0, 'gross_l': 1e-9}
-    trade_returns = []
+    consec_loss  = 0
+    cooldown     = 0
+    RING_SIZE    = 10
+    ring_buf     = np.zeros(RING_SIZE)
+    ring_head    = 0
+    ring_filled  = 0
+    ent_bal      = 100.0
+    ent_pos_size = 0.0
 
-    for row in df_main.itertuples():
-        curr_p = row.close
-        if pos is None:
-            side, mode = None, None
-            # ── 횡보 진입 ───────────────────────────────────────────────────
-            if getattr(row, f"adx_{r_tf}") < ind['r_adx_limit'] and \
-               getattr(row, f"adx_slope_{r_tf}") <= ind['r_slope_max'] and \
-               getattr(row, f"bbw_slope_{r_tf}") < 0:
-                if row.vol > (row.vol_mean * ind['r_vol_limit']):
-                    # [수정] r_tf(1h)의 RSI가 아닌, 3분봉의 rsi_3m을 사용합니다.
-                    rsi_v = row.rsi_3m 
-                    ma_v = getattr(row, f"ma20_{r_tf}")
-                    
-                    side = 'long'  if (rsi_v < ind['rsi_low']  and curr_p < ma_v) else \
-                           'short' if (rsi_v > ind['rsi_high'] and curr_p > ma_v) else None
-                    if side: mode = 'range'
-            # ── 강한추세 진입 ───────────────────────────────────────────────
-            if not mode:
-                if getattr(row, f"adx_{ts_tf}") > ind['t_adx_limit_strong'] and \
-                   getattr(row, f"adx_slope_{ts_tf}") >= ind['t_slope_strong']:
-                    rsi_v, ma_v = getattr(row, f"rsi_{ts_tf}"), getattr(row, f"ma20_{ts_tf}")
-                    # 롱/숏 비대칭 볼륨: 숏은 낮은 기준 허용 (원웨이 하락 포착)
-                    vol_base  = getattr(row, f"vol_{ts_tf}_mean") * ind['t_vol_limit_strong']
-                    vol_long  = getattr(row, f"cum_vol_{ts_tf}") > vol_base
-                    vol_short = getattr(row, f"cum_vol_{ts_tf}") > vol_base * ind['t_vol_short_ratio']
-                    if vol_long and curr_p > ma_v and rsi_v < ind['t_rsi_max_strong']:
-                        side, mode = 'long', 'trend_strong'
-                    elif vol_short and curr_p < ma_v and rsi_v > ind['t_rsi_min_strong']:
-                        side, mode = 'short', 'trend_strong'
-                if not mode:
-                    if getattr(row, f"adx_{tn_tf}") > ind['t_adx_limit_normal'] and \
-                       getattr(row, f"adx_slope_{tn_tf}") >= ind['t_slope_min']:
-                        rsi_v, ma_v = getattr(row, f"rsi_{tn_tf}"), getattr(row, f"ma20_{tn_tf}")
-                        # 롱/숏 비대칭 볼륨
-                        vol_base  = getattr(row, f"vol_{tn_tf}_mean") * ind['t_vol_limit_normal']
-                        vol_long  = getattr(row, f"cum_vol_{tn_tf}") > vol_base
-                        vol_short = getattr(row, f"cum_vol_{tn_tf}") > vol_base * ind['t_vol_short_ratio']
-                        if vol_long and curr_p > ma_v and rsi_v < ind['t_rsi_max_normal']:
-                            side, mode = 'long', 'trend_normal'
-                        elif vol_short and curr_p < ma_v and rsi_v > ind['t_rsi_min_normal']:
-                            side, mode = 'short', 'trend_normal'
-            if mode and side:
-                atr_pct = getattr(row, f"atr_{atr_tf}") / (curr_p + 1e-9)
-                pos_duration = 0
-                if mode == 'range':
-                    tp_pct = atr_pct * ind['r_tp_mult']
-                    # ATR 역비례 적응형 손절: 변동성 높으면 SL 좁고, 낮으면 넓음
-                    sl_pct = min(ind['r_sl_mult'] / (atr_pct + 1e-9), 0.02)
-                elif mode == 'trend_strong':
-                    tp_pct = atr_pct * ind['t_tp_mult']
-                    sl_pct = min(ind['t_sl_base_strong'] / (atr_pct + 1e-9), 0.05)
-                else:  # trend_normal
-                    tp_pct = atr_pct * ind['t_tp_short_mult']
-                    sl_pct = min(ind['t_sl_base_normal'] / (atr_pct + 1e-9), 0.05)
+    for i in range(len(close)):
+        cp = close[i]
 
-                if side == 'long':
-                    tp, sl = curr_p * (1 + tp_pct), curr_p * (1 - sl_pct)
-                else:
-                    tp, sl = curr_p * (1 - tp_pct), curr_p * (1 + sl_pct)
-                pos = {'side': side, 'ent_p': curr_p, 'sl': sl, 'tp': tp, 'mode': mode}
+        # ── v07: entry_tf 기반 신호 선택 ──────────
+        if use_1m > 0.5:
+            rsi_sig = rsi_1m[i]
+            mfi_sig = mfi_1m[i]
         else:
-            pos_duration += 1
-            is_exit, exit_p = False, curr_p
+            rsi_sig = rsi_3m[i]
+            mfi_sig = mfi_3m[i]
 
-            # ─── 트레일링 스탑 업데이트 (추세 모드 전용) ───────────────────────
-            # range 모드는 타임아웃으로 관리하므로 트레일링 불필요
-            if pos['mode'] != 'range':
-                entry_p = pos['ent_p']
-                if pos['side'] == 'long':
-                    # 현재 수익률이 발동 기준(t_sl_activate)을 초과했을 때만 트레일링 시작
-                    current_pnl_pct = (curr_p - entry_p) / (entry_p + 1e-9)
-                    if current_pnl_pct > ind['t_sl_activate']:
-                        # 새로운 트레일링 SL = 현재가에서 t_ts_mult만큼 아래
-                        trailing_sl = curr_p * (1 - ind['t_ts_mult'])
-                        # SL은 위쪽으로만 이동 (절대 내려가면 안 됨)
-                        if trailing_sl > pos['sl']:
-                            pos['sl'] = trailing_sl
-                else:  # short
-                    current_pnl_pct = (entry_p - curr_p) / (entry_p + 1e-9)
-                    if current_pnl_pct > ind['t_sl_activate']:
-                        # 새로운 트레일링 SL = 현재가에서 t_ts_mult만큼 위
-                        trailing_sl = curr_p * (1 + ind['t_ts_mult'])
-                        # SL은 아래쪽으로만 이동 (절대 올라가면 안 됨)
-                        if trailing_sl < pos['sl']:
-                            pos['sl'] = trailing_sl
-            # ────────────────────────────────────────────────────────────────────
-
-            # ─── 데드캣 바운스 조기 청산 (숏 전용) ──────────────────────────────
-            # 숏 보유 중 "3분봉 양봉 + 볼륨 스파이크" 감지 시 즉시 청산
-            # 조건: 양봉(close > open) AND 3분봉 RVOL > t_short_vol_exit
-            # 이유: 거래량 없이 하락하던 숏 흐름에서 갑자기 매수세가 들어오면
-            #       추세 전환 위험이 크므로 수익/손실 관계없이 탈출
-            if pos['mode'] != 'range' and pos['side'] == 'short':
-                is_green_candle = row.close > row.open
-                if is_green_candle and row.rvol_3m > ind['t_short_vol_exit']:
-                    is_exit = True  # SL/TP 체크보다 먼저 적용
-            # ────────────────────────────────────────────────────────────────────
-
-            if pos['mode'] == 'range' and pos_duration >= 15: is_exit = True
-            elif (curr_p <= pos['sl'] if pos['side'] == 'long' else curr_p >= pos['sl']): is_exit, exit_p = True, pos['sl']
-            elif (curr_p >= pos['tp'] if pos['side'] == 'long' else curr_p <= pos['tp']): is_exit, exit_p = True, pos['tp']
-            if is_exit:
-                # 잔고가 BAL_CAP 초과 시 실제 잔고의 10%만 포지션에 사용
-                # → 복리 폭발 방지 + 현실적인 리스크 관리 시뮬레이션
-                effective_bal = bal * 0.1 if bal > BAL_CAP else bal
-                pnl = effective_bal * (((exit_p - pos['ent_p'])/pos['ent_p'] if pos['side'] == 'long' else (pos['ent_p'] - exit_p)/pos['ent_p']) - (TAKER_FEE*2 + SLIPPAGE)) * LEVERAGE
-                bal += pnl
-                if bal > peak: peak = bal
-                mdd = max(mdd, (peak - bal) / (peak + 1e-9))
-                stats[pos['mode']]['trades'] += 1
-                if pnl > 0: stats[pos['mode']]['wins'] += 1; stats['gross_p'] += pnl
-                else: stats['gross_l'] += abs(pnl)
-                trade_returns.append(pnl)   # 거래별 손익 기록
-                pos = None
-                if mdd > MDD_LIMIT or bal <= 5.0: break
-
-    r_tr, n_tr, s_tr = stats['range']['trades'], stats['trend_normal']['trades'], stats['trend_strong']['trades']
-    total_trades = r_tr + n_tr + s_tr
-
-    # ─── 탈락 조건 ───────────────────────────────────────────────────────────
-    # 0회 → 그 시장 상황이 없었던 것, 허용
-    # 1~2회 → 우연 한두 번, 왜곡 위험 (range/normal)
-    # 1회   → 파워추세도 너무 적음 (strong)
-    # 파워추세는 발생 빈도가 낮으므로 최소치를 2회로 완화
-    mode_invalid = (
-        any(0 < tr < 3 for tr in [r_tr, n_tr]) or   # range/normal: 0 또는 3회+
-        (0 < s_tr < 2)                                # strong: 0 또는 2회+
-    )
-    if total_trades < 10 or mode_invalid or mdd > MDD_LIMIT:
-        return {**ind,
-                'Fitness': -1000000.0, 'ROI': bal - 100, 'PF': 0.0, 'MDD': mdd, 'Trades': total_trades}
-
-    pf = (stats['gross_p'] / stats['gross_l']) if stats['gross_l'] > 0 else 1.0
-    roi = bal - 100
-
-    # 1) Calmar Ratio: 수익률 ÷ MDD
-    #    MDD가 클수록 불리하게 설계 → 수익 대비 리스크를 측정
-    #    단순 ROI와 달리 큰 손실 구간을 가진 파라미터를 강력히 패널티
-    calmar = roi / (mdd * 100 + 1e-9)
-
-    # 2) 거래 일관성 (샤프 비율 개념)
-    #    평균 수익이 높고 편차가 작을수록 높은 점수
-    #    "99번 손실 + 1번 대박" 유형의 파라미터는 std가 매우 커서 점수 하락
-    mean_ret = np.mean(trade_returns)
-    std_ret  = np.std(trade_returns) + 1e-9
-    consistency = mean_ret / std_ret
-
-    # 3) 거래 횟수 가중치 (로그 스케일)
-    #    거래가 많을수록 통계적 신뢰도가 높다고 판단
-    #    단, 선형이 아닌 로그로 취해서 "거래 수 늘리기" 식의 어뷰징 방지
-    trade_weight = np.log(total_trades + 1)
-
-    # 최종 피트니스: 세 요소의 곱
-    #  - calmar > 0 (흑자) 이고 consistency > 0 (평균 거래가 수익) 일 때만 양수
-    #  - 둘 중 하나라도 음수면 전체 음수 → 자동 탈락
-    #  - trade_weight는 항상 양수이므로 방향은 바꾸지 않고 크기만 조정
-    if calmar > 0:
-        fitness = calmar * consistency * trade_weight
-    else:
-        # 손실 구간: calmar만 사용해서 최소한의 순위 구분
-        fitness = calmar * trade_weight
-
-    return {**ind,   # 파라미터 먼저 → 아래 계산값이 덮어씀 (순서 중요)
-            'Fitness': fitness, 'ROI': roi, 'PF': pf, 'MDD': mdd, 'Trades': total_trades,
-            'Calmar': round(calmar, 4), 'Consistency': round(consistency, 4)}
-    # ──────────────────────────────────────────────────────────────────────────
-
-# [4. GA 루프 (PATIENCE 추가)]
-def run_ga(df_train):
-    population = [{**{k: random.uniform(v[0], v[1]) for k, v in GENE_BOUNDS.items()},
-                   **{tf: random.choice(INTERVALS) for tf in TF_KEYS}}
-                  for _ in range(POP_SIZE)]
-    best_overall_fitness, no_improvement_count, best_individual = -float('inf'), 0, None
-    
-    for gen in range(GENERATIONS):
-        with Pool(cpu_count()) as p:
-            results = p.map(evaluate, [(ind, df_train) for ind in population])
-        results.sort(key=lambda x: x['Fitness'], reverse=True)
-        
-        if results[0]['Fitness'] > best_overall_fitness:
-            best_overall_fitness, best_individual, no_improvement_count = results[0]['Fitness'], results[0], 0
-        else:
-            no_improvement_count += 1
-        
-        if no_improvement_count >= PATIENCE:
-            print(f"   ⏱️ {PATIENCE}세대 정체로 조기 종료 (세대: {gen+1})")
-            break
-            
-        elites = results[:ELITE_SIZE]
-        new_pop = [{k: v for k, v in e.items() if k in list(GENE_BOUNDS.keys()) + TF_KEYS} for e in elites]
-        while len(new_pop) < POP_SIZE:
-            p1, p2 = random.sample(elites, 2)
-            child = {k: (random.choice([p1[k], p2[k]]) if random.random() > MUTATION_RATE else random.uniform(GENE_BOUNDS[k][0], GENE_BOUNDS[k][1])) for k in GENE_BOUNDS.keys()}
-            for tf in TF_KEYS: child[tf] = random.choice([p1[tf], p2[tf]])
-            new_pop.append(child)
-        population = new_pop
-    return best_individual
-
-if __name__ == "__main__":
-    import math, os
-
-    # ── 저장 파일 경로 ────────────────────────────────────────────────────────
-    FILE_PARAMS = "WFA_Params.csv"       # 채택된 파라미터 (윈도우마다 append)
-    FILE_OOS    = "WFA_OOS_Summary.csv"  # 전체 윈도우 요약 (윈도우마다 append)
-
-    df_all = prepare_full_data()
-    if df_all is not None:
-
-        # ── 이어쓰기 지원: 기존 파일에서 마지막 윈도우 번호와 OOS 상태 복원 ──
-        if os.path.exists(FILE_OOS):
-            prev = pd.read_csv(FILE_OOS)
-            win_idx  = int(prev['window'].max())
-            oos_bal  = float(prev['oos_bal'].iloc[-1])
-            oos_peak = float(prev['oos_bal'].max())
-            oos_mdd  = float(prev['oos_mdd_cumul'].iloc[-1]) if 'oos_mdd_cumul' in prev.columns else 0.0
-
-            # 마지막으로 완료된 윈도우의 test_end 다음 날부터 재시작
-            last_test_end = pd.to_datetime(prev['test_end'].iloc[-1])
-            # test_end = train_end + TEST_DAYS → train_start 역산
-            current_train_start = last_test_end - pd.Timedelta(days=TEST_DAYS_PER_WIN + TRAIN_DAYS - STEP_DAYS)
-            print(f"⏩ 기존 파일 발견 → 윈도우 {win_idx}부터 이어서 시작")
-        else:
-            win_idx  = 0
-            oos_bal  = 100.0
-            oos_peak = 100.0
-            oos_mdd  = 0.0
-            current_train_start = df_all['ts'].min()
-            print(f"🆕 새로 시작")
-
-        # ── 채택 기준 (테스트 구간 절대 성과 기준) ──────────────────────────
-        # 비율 기준(test/train)을 쓰지 않는 이유:
-        #   GA는 항상 학습 구간을 최대한 과적합시키도록 설계되어 있어서
-        #   train ROI가 수천~수만%가 나오는 건 당연한 결과임
-        #   그 결과 test/train 비율은 구조적으로 항상 낮을 수밖에 없음
-        # → 테스트 구간 자체가 "쓸 만한가"를 절대 기준으로 판단
-        MIN_TEST_ROI    =  5.0   # 테스트 구간 최소 수익률 (%)
-        MAX_TEST_MDD    =  0.40  # 테스트 구간 최대 허용 MDD (40%)
-        MIN_TEST_TRADES =  5    # 테스트 구간 최소 거래 수
-
-        while True:
-            train_end = current_train_start + pd.Timedelta(days=TRAIN_DAYS)
-            test_end  = train_end + pd.Timedelta(days=TEST_DAYS_PER_WIN)
-            if test_end > df_all['ts'].max(): break
-
-            win_idx += 1
-            print(f"\n{'='*60}")
-            print(f"📂 윈도우 {win_idx} | 학습: {current_train_start.date()} ~ {train_end.date()} "
-                  f"| 테스트: {train_end.date()} ~ {test_end.date()}")
-
-            # ── STEP 1: 학습 구간 GA 최적화 ──────────────────────────────────
-            df_train = df_all[(df_all['ts'] >= current_train_start) & (df_all['ts'] < train_end)]
-            best_params = run_ga(df_train)
-
-            if not best_params or best_params['Fitness'] <= -1000:
-                print(f"   ⚠️ 유효한 파라미터를 찾지 못함 → 이 윈도우 건너뜀")
-                current_train_start += pd.Timedelta(days=STEP_DAYS)
+        if not in_pos:
+            if cooldown > 0:
+                cooldown -= 1
                 continue
 
-            train_roi = best_params['ROI']
-            print(f"   [학습] ROI: {min(train_roi, BAL_CAP-100):.2f}% | MDD: {best_params['MDD']*100:.1f}% | "
-                  f"Calmar: {best_params.get('Calmar', 0):.3f} | "
-                  f"Consistency: {best_params.get('Consistency', 0):.3f} | "
-                  f"Trades: {best_params['Trades']}")
+            new_side = 0; new_mode = -1
 
-            # ── STEP 2: 테스트 구간 실전 평가 ────────────────────────────────
-            df_test = df_all[(df_all['ts'] >= train_end) & (df_all['ts'] < test_end)]
-            test_result = evaluate((best_params, df_test))
-            test_roi    = test_result['ROI']
-            test_mdd    = test_result['MDD']
-            test_trades = test_result['Trades']
+            # ─────────────────────────────────────
+            # ① 횡보 진입 (mode 0)
+            #
+            # [1h] ADX 낮음 + 기울기 감소 + Choppiness 높음 + 거래량
+            # [15m] Choppiness 높음 + ADX 낮음
+            # [신호] RSI OR MFI (v07: AND→OR, 진입빈도 증가)
+            #        + 1h/15m MA 방향 필터
+            # ─────────────────────────────────────
+            if (adx_1h[i]       < r_adx_limit
+                    and adx_slope_1h[i] <= r_slope_max
+                    and chop_1h[i]      >= r_chop_min
+                    and vol[i]          >  vol_mean[i] * r_vol_limit):
 
-            # ── STEP 3: 테스트 구간 절대 성과 판정 ──────────────────────────
-            # 세 조건을 모두 통과해야 채택
-            # 1) 테스트 구간에서 수익이 났는가 (MIN_TEST_ROI 이상)
-            # 2) MDD가 허용 범위 안인가 (MAX_TEST_MDD 이하)
-            # 3) 거래가 충분히 있었는가 (MIN_TEST_TRADES 이상, 운에 의한 결과 방지)
-            reason = []
-            if test_roi   <  MIN_TEST_ROI:    reason.append(f"ROI {test_roi:.1f}% < {MIN_TEST_ROI}%")
-            if test_mdd   >  MAX_TEST_MDD:    reason.append(f"MDD {test_mdd*100:.1f}% > {MAX_TEST_MDD*100:.0f}%")
-            if test_trades < MIN_TEST_TRADES: reason.append(f"거래 {test_trades}회 < {MIN_TEST_TRADES}회")
+                if (chop_15m[i]  >= r_chop_15m_min
+                        and adx_15m[i] <  r_adx_15m_max):
 
-            is_accepted = len(reason) == 0
-            status = "✅ 채택" if is_accepted else f"❌ 기각 ({' / '.join(reason)})"
-            print(f"   [테스트] ROI: {test_roi:.2f}% | MDD: {test_mdd*100:.1f}% | "
-                  f"Trades: {test_trades} → {status}")
+                    # 롱: (RSI 과매도 OR MFI 과매도) + MA 하방
+                    if ((rsi_sig < rsi_low or mfi_sig < r_mfi_low)
+                            and cp < ma20_1h[i]
+                            and cp < ma20_15m[i]):
+                        new_side =  1; new_mode = 0
 
-            # ── STEP 4: OOS 누적 곡선 업데이트 ──────────────────────────────
-            if test_trades > 0:
-                oos_bal *= max(1 + test_roi / 100, 0)  # 음수 방지
-                if oos_bal > oos_peak: oos_peak = oos_bal
-                oos_mdd = max(oos_mdd, (oos_peak - oos_bal) / (oos_peak + 1e-9))
+                    # 숏: (RSI 과매수 OR MFI 과매수) + MA 상방
+                    elif ((rsi_sig > rsi_high or mfi_sig > r_mfi_high)
+                            and cp > ma20_1h[i]
+                            and cp > ma20_15m[i]):
+                        new_side = -1; new_mode = 0
 
-            # ── STEP 5: 윈도우 완료 → 즉시 파일에 기록 ──────────────────────
-            # OOS 요약 한 줄 append
-            oos_row = pd.DataFrame([{
-                'window'        : win_idx,
-                'train_start'   : current_train_start.date(),
-                'train_end'     : train_end.date(),
-                'test_end'      : test_end.date(),
-                'train_roi'     : round(train_roi, 4),
-                'test_roi'      : round(test_roi, 4),
-                'test_mdd'      : round(test_mdd, 4),
-                'test_trades'   : test_trades,
-                'is_accepted'   : is_accepted,
-                'oos_bal'       : round(oos_bal, 4),
-                'oos_mdd_cumul' : round(oos_mdd, 4),
-            }])
-            # header=True는 파일이 없을 때만, 이후엔 header=False로 append
-            oos_row.to_csv(FILE_OOS, mode='a',
-                           header=not os.path.exists(FILE_OOS) or win_idx == 1,
-                           index=False, encoding='utf-8-sig')
+            # ─────────────────────────────────────
+            # ② 추세 진입 (mode 1/2)
+            #
+            # [4h] ADX 높음 + 기울기 양수 + Choppiness 낮음
+            # [1h] MACD 방향 + 가격 MA 위치
+            # [15m] 거래량 + ADX + 가격 MA
+            # [신호] RSI/MFI 오버바이·오버셀 차단 (AND 유지)
+            # ─────────────────────────────────────
+            elif (adx_4h[i]        >  t_adx_4h_min
+                    and adx_slope_4h[i] >= t_slope_4h_min
+                    and chop_4h[i]      <  t_chop_4h_max):
 
-            # 채택된 파라미터 append
-            if is_accepted:
-                param_row = best_params.copy()
-                param_row.update({
-                    'win_idx'    : win_idx,
-                    'train_roi'  : round(train_roi, 4),
-                    'test_roi'   : round(test_roi, 4),
-                    'test_mdd'   : round(test_mdd, 4),
-                    'start_date' : current_train_start.date(),
-                    'end_date'   : train_end.date(),
-                })
-                param_df = pd.DataFrame([param_row])
-                param_df.to_csv(FILE_PARAMS, mode='a',
-                                header=not os.path.exists(FILE_PARAMS),
-                                index=False, encoding='utf-8-sig')
+                cur_mode = 2 if adx_4h[i] > t_adx_strong_thresh else 1
 
-            print(f"   💾 저장 완료 → {FILE_OOS}"
-                  + (f" / {FILE_PARAMS}" if is_accepted else ""))
+                if (macd_hist_1h[i]  >  t_macd_1h_thresh
+                        and cp          >  ma20_1h[i]):
 
-            current_train_start += pd.Timedelta(days=STEP_DAYS)
+                    if (rolling_vol_15m[i] > vol_15m_mean[i] * t_vol_15m_ratio
+                            and adx_15m[i]     >  t_adx_15m_min
+                            and cp             >  ma20_15m[i]):
 
-        # ── 최종 리포트 ───────────────────────────────────────────────────────
+                        if (rsi_sig < t_rsi_max
+                                and mfi_sig < t_mfi_max):
+                            new_side =  1; new_mode = cur_mode
+
+                elif (macd_hist_1h[i] < -t_macd_1h_thresh
+                        and cp            <  ma20_1h[i]):
+
+                    if (rolling_vol_15m[i] > vol_15m_mean[i] * t_vol_15m_ratio * t_vol_short_ratio
+                            and adx_15m[i]     >  t_adx_15m_min
+                            and cp             <  ma20_15m[i]):
+
+                        if (rsi_sig > t_rsi_min
+                                and mfi_sig > t_mfi_min):
+                            new_side = -1; new_mode = cur_mode
+
+            # ─────────────────────────────────────
+            # 레짐 필터
+            # v07: regime_thresh 유전자로 탐색 (기존 하드코딩 1.0 제거)
+            # ─────────────────────────────────────
+            if new_mode >= 0:
+                counter_trend = (
+                    (new_side ==  1 and regime[i] <  regime_thresh) or
+                    (new_side == -1 and regime[i] >= regime_thresh)
+                )
+                if counter_trend:
+                    new_mode = -1
+
+            if new_mode >= 0:
+                ent_regime_scale = 1.0
+
+                atr_pct = atr[i] / (cp + 1e-9)
+                if new_mode == 0:
+                    tp_p = atr_pct * r_tp_mult
+                    # v07: SL 캡 0.02→0.05 (FARTCOIN 변동성 대응)
+                    sl_p = min(atr_pct * r_sl_mult, 0.05)
+                elif new_mode == 2:
+                    tp_p = atr_pct * t_tp_strong_mult
+                    sl_p = min(atr_pct * t_sl_strong, 0.05)
+                else:
+                    tp_p = atr_pct * t_tp_normal_mult
+                    sl_p = min(atr_pct * t_sl_normal, 0.05)
+
+                tp = cp * (1 + tp_p) if new_side == 1 else cp * (1 - tp_p)
+                sl = cp * (1 - sl_p) if new_side == 1 else cp * (1 + sl_p)
+                side, mode, ent_p, dur, in_pos = new_side, new_mode, cp, 0, True
+
+                pos_rate_cap = min(1.0, b_cap / (bal + 1e-9))
+                if ring_filled >= RING_SIZE:
+                    rec_gp = 0.0; rec_gl = 1e-9
+                    for j in range(RING_SIZE):
+                        v = ring_buf[j]
+                        if v > 0: rec_gp += v
+                        else:     rec_gl += abs(v)
+                    pf = rec_gp / rec_gl
+                    perf_scale = min(1.0, max(0.5, pf / 1.5))
+                else:
+                    perf_scale = 0.75
+
+                ent_bal      = bal
+                ent_pos_size = ent_bal * pos_rate_cap * perf_scale * ent_regime_scale
+
+        else:
+            dur += 1
+            is_exit = False
+            exit_p  = cp
+
+            # ── 트레일링 스탑 (추세 모드) ────────────
+            if mode != 0:
+                if side == 1 and (cp - ent_p) / ent_p > t_sl_activate:
+                    tsl = cp * (1 - t_ts_mult)
+                    if tsl > sl: sl = tsl
+                elif side == -1 and (ent_p - cp) / ent_p > t_sl_activate:
+                    tsl = cp * (1 + t_ts_mult)
+                    if tsl < sl: sl = tsl
+
+            # ── 데드캣 조기 청산 ─────────────────────
+            if mode != 0 and side == -1:
+                vol_exit_cond = rolling_vol_15m[i] > vol_15m_mean[i] * t_short_vol_exit
+                if close[i] > open_[i] and cp > ma20_1h[i] and vol_exit_cond:
+                    is_exit = True
+
+            # ── TP / SL / 타임아웃 ───────────────────
+            if not is_exit:
+                if mode == 0 and dur >= 15:
+                    is_exit = True
+                elif (side == 1 and cp <= sl) or (side == -1 and cp >= sl):
+                    is_exit = True; exit_p = sl
+                elif (side == 1 and cp >= tp) or (side == -1 and cp <= tp):
+                    is_exit = True; exit_p = tp
+
+            if is_exit:
+                raw_ret = ((exit_p - ent_p) / ent_p) if side == 1 else ((ent_p - exit_p) / ent_p)
+                pnl     = ent_pos_size * (raw_ret - fee * 2 - slip) * lev
+                bal    += pnl
+                trade_pnls.append(pnl)
+
+                ring_buf[ring_head] = pnl
+                ring_head = (ring_head + 1) % RING_SIZE
+                if ring_filled < RING_SIZE: ring_filled += 1
+
+                if bal > peak: peak = bal
+                mdd = max(mdd, (peak - bal) / peak)
+                tr_counts[mode] += 1
+                if pnl > 0:
+                    consec_loss = 0
+                else:
+                    consec_loss += 1
+                    if consec_loss >= consec_loss_th:
+                        cooldown    = cooldown_max
+                        consec_loss = 0
+                in_pos = False
+                if mdd > mdd_lim or bal <= 5.0:
+                    break
+
+    return bal, mdd, tr_counts, np.array(trade_pnls)
+
+
+# ─────────────────────────────────────────────
+# [6. 평가 인프라]
+#
+# ★ v07 변경점:
+#   ① _init_worker: df_is / df_ov 두 개 분리 저장
+#   ② evaluate_fast: IS + OOS_val 각각 백테스트 후 하모닉 평균
+#      → 한쪽에만 과최적화된 파라미터 자동 탈락
+#   ③ _parse_result: 최소 거래수 10/20→3/8
+#   ④ Fitness ROI 캡 80→40, Calmar 캡 10→5
+# ─────────────────────────────────────────────
+_worker_data: dict = {}
+
+def _init_worker(df_is: pd.DataFrame, df_ov: pd.DataFrame) -> None:
+    """v07: IS / OOS_val 두 개 데이터셋 공유"""
+    global _worker_data
+    _worker_data['df_is'] = df_is
+    _worker_data['df_ov'] = df_ov
+
+
+def _build_core_args(ind: dict, df: pd.DataFrame):
+    """
+    ★ v07 변경점:
+      - rsi_3m / mfi_3m 추가 (entry_tf='3m' 선택 시 사용)
+      - use_1m 스칼라 플래그 추가
+      - regime_thresh p_vals 마지막에 포함 (GENE_BOUNDS에 있어 자동 포함)
+    """
+    atr_tf = ind['atr_inter']
+    use_1m = 1.0 if ind.get('entry_tf', '1m') == '1m' else 0.0
+    p_vals = np.array([ind[k] for k in _NUMERIC_KEYS], dtype=np.float64)
+
+    r_tf = R_INTER_FIXED  # '1h'
+
+    return (
+        df['close'].values,
+        df['open'].values,
+        df['vol'].values,
+        df['vol_mean'].values,
+        # 1m 신호
+        df['rsi_1m'].values,
+        df['mfi_1m'].values,
+        # 3m 신호 (v07 신규)
+        df['rsi_3m'].values,
+        df['mfi_3m'].values,
+        # entry_tf 플래그 (v07 신규)
+        use_1m,
+        # 15m
+        df['ma20_15m'].values,
+        df['adx_15m'].values,
+        df['chop_15m'].values,
+        df['vol_15m_mean'].values,
+        df['rolling_vol_15m'].values,
+        # 1h
+        df[f'adx_{r_tf}'].values,
+        df[f'adx_slope_{r_tf}'].values,
+        df[f'chop_{r_tf}'].values,
+        df[f'ma20_{r_tf}'].values,
+        df[f'macd_hist_norm_{r_tf}'].values,
+        # 4h
+        df['adx_4h'].values,
+        df['adx_slope_4h'].values,
+        df['chop_4h'].values,
+        # ATR
+        df[f'atr_{atr_tf}'].values,
+        # 레짐
+        df['regime_str'].values,
+        p_vals, LEVERAGE, TAKER_FEE, SLIPPAGE, MDD_LIMIT, BAL_CAP
+    )
+
+
+def _parse_result(ind: dict, bal, mdd, tr_c, pnls) -> dict:
+    total_tr = int(np.sum(tr_c))
+    roi      = bal - 100.0
+    # v07: 최소 거래수 10/20→3/8 (OOS 거래 부족 문제 대응)
+    if total_tr < 3 or mdd > MDD_LIMIT or bal <= 5.0:
+        return {**ind, 'Fitness': -1e6, 'ROI': roi, 'MDD': mdd, 'Trades': total_tr}
+    if total_tr < 8 or bal <= 10.0:
+        return {**ind, 'Fitness': -1e7, 'ROI': roi, 'MDD': mdd, 'Trades': total_tr}
+    calmar      = roi / (mdd * 100 + 1e-9)
+    consistency = (pnls.mean() / (pnls.std() + 1e-9)) if len(pnls) > 0 else 0.0
+    # v07: ROI 캡 80→40, Calmar 캡 10→5 (과최적화 억제 강화)
+    roi_capped    = min(roi, 40.0)
+    calmar_capped = min(calmar, 5.0)
+    fitness       = np.log1p(max(0.0, roi_capped)) * calmar_capped * consistency * np.log10(total_tr + 1)
+    return {**ind, 'Fitness': fitness, 'ROI': roi, 'MDD': mdd, 'Trades': total_tr}
+
+
+def evaluate_fast(ind: dict) -> dict:
+    """
+    v07: IS + OOS_val 분리 평가 + 하모닉 평균 Fitness
+    두 기간 모두에서 수익이 나야 높은 점수 → 과최적화 자동 탈락
+    """
+    df_is = _worker_data['df_is']
+    df_ov = _worker_data['df_ov']
+    try:
+        res_is = _run_backtest_core(*_build_core_args(ind, df_is))
+        res_ov = _run_backtest_core(*_build_core_args(ind, df_ov))
+    except Exception:
+        return {**ind, 'Fitness': -1e9, 'ROI': -100.0, 'MDD': 1.0, 'Trades': 0}
+
+    r_is = _parse_result(ind, *res_is)
+    r_ov = _parse_result(ind, *res_ov)
+
+    f_is = r_is['Fitness']
+    f_ov = r_ov['Fitness']
+
+    # 하모닉 평균: 한쪽만 잘되면 낮은 점수 → 두 기간 모두 안정적인 파라미터 선택
+    if f_is <= 0 or f_ov <= 0:
+        combined = min(f_is, f_ov)
+    else:
+        combined = 2.0 * f_is * f_ov / (f_is + f_ov)
+
+    return {**ind, 'Fitness': combined, 'ROI': r_is['ROI'],
+            'MDD': r_is['MDD'], 'Trades': r_is['Trades']}
+
+
+def evaluate_on_df(ind: dict, df: pd.DataFrame) -> dict:
+    """테스트/클러스터 검증 전용"""
+    try:
+        res = _run_backtest_core(*_build_core_args(ind, df))
+    except Exception:
+        return {**ind, 'Fitness': -1e9, 'ROI': -100.0, 'MDD': 1.0, 'Trades': 0}
+    return _parse_result(ind, *res)
+
+
+# ─────────────────────────────────────────────
+# [7. 유전 알고리즘]
+#
+# ★ v07 변경점:
+#   ① 학습 데이터 IS/OOS_val 분리 후 _init_worker에 전달
+#   ② entry_tf 유전자 교배/돌연변이 처리
+#   ③ IS 분리 비율: IS_SPLIT_RATIO (기본 0.70)
+# ─────────────────────────────────────────────
+def run_ga(df_train: pd.DataFrame) -> tuple[dict | None, list[dict]]:
+    gene_keys = list(_NUMERIC_KEYS) + TF_KEYS
+
+    # v07: IS / OOS_val 분리 (안티-오버피팅 핵심)
+    n = len(df_train)
+    split_idx = int(n * IS_SPLIT_RATIO)
+    df_is = df_train.iloc[:split_idx].reset_index(drop=True)
+    df_ov = df_train.iloc[split_idx:].reset_index(drop=True)
+    print(f"   IS: {len(df_is):,}봉 / OOS_val: {len(df_ov):,}봉 (분리비율 {IS_SPLIT_RATIO:.0%})")
+
+    population = [
+        {
+            **{k: random.uniform(v[0], v[1]) for k, v in GENE_BOUNDS.items()},
+            'atr_inter': random.choice(TF_OPTIONS),
+            'entry_tf':  random.choice(TF_OPTIONS_ENT),   # v07: entry_tf 추가
+        }
+        for _ in range(POP_SIZE)
+    ]
+    best_overall_fitness = -float('inf')
+    no_improvement_count = 0
+    best_individual      = None
+    final_elites         = []
+
+    with Pool(cpu_count(), initializer=_init_worker, initargs=(df_is, df_ov)) as pool:
+        for gen in range(GENERATIONS):
+            results = pool.map(evaluate_fast, population)
+            results.sort(key=lambda x: x['Fitness'], reverse=True)
+
+            if results[0]['Fitness'] > best_overall_fitness:
+                best_overall_fitness = results[0]['Fitness']
+                best_individual      = results[0]
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+
+            if no_improvement_count >= PATIENCE:
+                print(f"   ⏱️ {PATIENCE}세대 정체 → 조기 종료 (세대: {gen + 1})")
+                break
+
+            elites       = results[:ELITE_SIZE]
+            final_elites = elites
+            new_pop = [
+                {k: v for k, v in e.items() if k in gene_keys}
+                for e in elites
+            ]
+            while len(new_pop) < POP_SIZE:
+                p1, p2 = random.sample(elites, 2)
+                child = {
+                    k: (random.choice([p1[k], p2[k]])
+                        if random.random() > MUTATION_RATE
+                        else random.uniform(GENE_BOUNDS[k][0], GENE_BOUNDS[k][1]))
+                    for k in _NUMERIC_KEYS
+                }
+                child['atr_inter'] = random.choice([p1['atr_inter'], p2['atr_inter']])
+                # v07: entry_tf 교배/돌연변이
+                child['entry_tf']  = (
+                    random.choice([p1['entry_tf'], p2['entry_tf']])
+                    if random.random() > MUTATION_RATE
+                    else random.choice(TF_OPTIONS_ENT)
+                )
+                new_pop.append(child)
+            population = new_pop
+
+    top_k = [
+        {k: v for k, v in e.items() if k in gene_keys}
+        for e in final_elites[:TOP_K_COLLECT]
+    ]
+    return best_individual, top_k
+
+
+# ─────────────────────────────────────────────
+# [8. 클러스터링 분석]
+# ─────────────────────────────────────────────
+def _normalize(candidates: list[dict]) -> np.ndarray:
+    X = np.array([[c[k] for k in _NUMERIC_KEYS] for c in candidates])
+    return (X - _BOUNDS_LO) / (_BOUNDS_HI - _BOUNDS_LO + 1e-9)
+
+
+def _find_optimal_k(X_norm: np.ndarray, k_range: range) -> int:
+    best_k, best_score = k_range.start, -1.0
+    for k in k_range:
+        if k >= len(X_norm):
+            break
+        labels = KMeans(n_clusters=k, n_init=10, random_state=42).fit_predict(X_norm)
+        if len(set(labels)) < 2:
+            continue
+        score = silhouette_score(X_norm, labels)
+        if score > best_score:
+            best_score, best_k = score, k
+    return best_k
+
+
+def _build_medoids(
+    candidates: list[dict],
+    X_norm: np.ndarray,
+    labels: np.ndarray,
+    n_clusters: int,
+) -> list[dict]:
+    medoids = []
+    for c in range(n_clusters):
+        mask      = labels == c
+        members_X = X_norm[mask]
+        members_c = [cand for cand, m in zip(candidates, mask) if m]
+        if not members_c:
+            continue
+
+        centroid  = members_X.mean(axis=0)
+        dists     = np.linalg.norm(members_X - centroid, axis=1)
+        best_idx  = int(np.argmin(dists))
+        medoid    = members_c[best_idx].copy()
+
+        # TF 유전자: 클러스터 내 다수결
+        for tf_key in TF_KEYS:
+            vals = [m[tf_key] for m in members_c]
+            medoid[tf_key] = max(set(vals), key=vals.count)
+
+        medoids.append({
+            'cluster_id'   : c,
+            'cluster_size' : int(mask.sum()),
+            'centroid_dist': round(float(dists[best_idx]), 6),
+            'medoid'       : medoid,
+        })
+    return medoids
+
+
+def run_cluster_analysis(
+    all_candidates: list[dict],
+    test_windows: list[tuple],
+    file_cluster_csv: str,
+    file_best_params_csv: str,
+) -> dict | None:
+    n_cands = len(all_candidates)
+    n_wins  = len(test_windows)
+    print(f"\n{'='*60}")
+    print(f"🔬 클러스터 분석 시작 | 후보: {n_cands}개 / 테스트 윈도우: {n_wins}개")
+
+    if n_wins < MIN_CLUSTER_WIN:
+        print(f"   ⚠️ 테스트 윈도우 {n_wins}개 < 최소 {MIN_CLUSTER_WIN}개 → 스킵")
+        return None
+
+    X_norm = _normalize(all_candidates)
+    k_max  = min(MAX_CLUSTERS, n_wins, n_cands // 2)
+    if k_max < 2:
+        print("   ⚠️ 클러스터 수 부족 → 스킵")
+        return None
+
+    best_k  = _find_optimal_k(X_norm, range(2, k_max + 1))
+    labels  = KMeans(n_clusters=best_k, n_init=20, random_state=42).fit_predict(X_norm)
+    medoids = _build_medoids(all_candidates, X_norm, labels, best_k)
+    print(f"   최적 K: {best_k} (후보 {n_cands}개 → {len(medoids)}개 클러스터)")
+
+    cluster_rows = []
+    best_medoid  = None
+    best_calmar  = -float('inf')
+
+    for info in medoids:
+        med    = info['medoid']
+        rois   = []
+        mdds_w = []
+        trades = []
+
+        for win_idx, t_start, t_end, te_end, df_test in test_windows:
+            r = evaluate_on_df(med, df_test)
+            rois.append(r['ROI'])
+            mdds_w.append(r['MDD'])
+            trades.append(r['Trades'])
+
+        valid_rois = [roi for roi, t in zip(rois, trades) if t >= MIN_TEST_TRADES]
+        avg_roi    = float(np.mean(valid_rois)) if valid_rois else -999.0
+        win_rate   = sum(1 for roi in valid_rois if roi >= MIN_TEST_ROI) / max(len(valid_rois), 1)
+        max_mdd    = float(max(mdds_w)) if mdds_w else 1.0
+        calmar     = avg_roi / (max_mdd * 100 + 1e-9) if valid_rois else -999.0
+
+        c_bal = 100.0; c_peak = 100.0; c_mdd = 0.0
+        for roi in rois:
+            c_bal *= max(1.0 + min(roi, BAL_CAP - 100.0) / 100.0, 0.0)
+            if c_bal > c_peak: c_peak = c_bal
+            c_mdd = max(c_mdd, (c_peak - c_bal) / (c_peak + 1e-9))
+
+        row = {
+            'cluster_id'    : info['cluster_id'],
+            'cluster_size'  : info['cluster_size'],
+            'centroid_dist' : info['centroid_dist'],
+            'avg_oos_roi'   : round(avg_roi, 4),
+            'oos_win_rate'  : round(win_rate, 4),
+            'max_oos_mdd'   : round(max_mdd, 4),
+            'calmar'        : round(calmar, 4),
+            'oos_final_bal' : round(c_bal, 4),
+            'oos_cum_mdd'   : round(c_mdd, 4),
+            'window_rois'   : str([round(r, 2) for r in rois]),
+        }
+        cluster_rows.append(row)
+
+        print(f"   클러스터 {info['cluster_id']:2d} "
+              f"(크기:{info['cluster_size']:3d}) | "
+              f"avg ROI: {avg_roi:+6.2f}% | 승률: {win_rate*100:.0f}% | "
+              f"MDD: {max_mdd*100:.1f}% | Calmar: {calmar:.3f} | OOS잔고: ${c_bal:,.2f}")
+
+        if calmar > best_calmar:
+            best_calmar = calmar
+            best_medoid = med.copy()
+            best_medoid['cluster_id']    = info['cluster_id']
+            best_medoid['cluster_size']  = info['cluster_size']
+            best_medoid['avg_oos_roi']   = round(avg_roi, 4)
+            best_medoid['oos_win_rate']  = round(win_rate, 4)
+            best_medoid['max_oos_mdd']   = round(max_mdd, 4)
+            best_medoid['calmar']        = round(calmar, 4)
+            best_medoid['oos_final_bal'] = round(c_bal, 4)
+
+    pd.DataFrame(cluster_rows).to_csv(file_cluster_csv, index=False, encoding='utf-8-sig')
+    print(f"\n   💾 클러스터 분석 결과 → {file_cluster_csv}")
+
+    if best_medoid is not None:
+        print(f"\n   🏆 최우수 클러스터: {best_medoid['cluster_id']} "
+              f"| Calmar: {best_medoid['calmar']:.3f} "
+              f"| avg ROI: {best_medoid['avg_oos_roi']:+.2f}% "
+              f"| OOS 잔고: ${best_medoid['oos_final_bal']:,.2f}")
+        pd.DataFrame([best_medoid]).to_csv(file_best_params_csv, index=False, encoding='utf-8-sig')
+        print(f"   💾 최우수 클러스터 파라미터 → {file_best_params_csv}")
+
+    return best_medoid
+
+
+# ─────────────────────────────────────────────
+# [9. WFA 메인 루프]
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    FILE_OOS          = "WFA_OOS_Summary.csv"
+    FILE_PARAMS       = "WFA_Params.csv"
+    FILE_CLUSTER      = "WFA_Cluster_Analysis.csv"
+    FILE_CLUSTER_BEST = "WFA_Cluster_Best_Params.csv"
+
+    df_all = prepare_full_data()
+    if df_all is None:
+        exit(1)
+
+    if os.path.exists(FILE_OOS):
+        prev                = pd.read_csv(FILE_OOS)
+        win_idx             = int(prev['window'].max())
+        oos_bal             = float(prev['oos_bal'].iloc[-1])
+        oos_peak            = float(prev['oos_bal'].max())
+        oos_mdd             = float(prev['oos_mdd_cumul'].iloc[-1]) if 'oos_mdd_cumul' in prev.columns else 0.0
+        last_test_end       = pd.to_datetime(prev['test_end'].iloc[-1])
+        current_train_start = last_test_end - pd.Timedelta(days=TEST_DAYS_PER_WIN + TRAIN_DAYS - STEP_DAYS)
+        print(f"⏩ 기존 파일 발견 → 윈도우 {win_idx}부터 이어서 시작")
+    else:
+        win_idx             = 0
+        oos_bal             = 100.0
+        oos_peak            = 100.0
+        oos_mdd             = 0.0
+        current_train_start = df_all['ts'].min()
+        print("🆕 새로 시작")
+
+    all_candidates: list[dict] = []
+    test_windows:   list[tuple] = []
+
+    # ─── Phase 1: 모든 윈도우 GA 학습 + 후보 수집 ─
+    while True:
+        train_end = current_train_start + pd.Timedelta(days=TRAIN_DAYS)
+        test_end  = train_end           + pd.Timedelta(days=TEST_DAYS_PER_WIN)
+        if test_end > df_all['ts'].max():
+            break
+
+        win_idx += 1
         print(f"\n{'='*60}")
-        print(f"🏁 WFA 완료")
-        if os.path.exists(FILE_OOS):
-            df_oos = pd.read_csv(FILE_OOS)
-            total_wins = int(df_oos['window'].max())
-            accepted   = df_oos['is_accepted'].sum()
-            print(f"   총 {total_wins}개 윈도우 | 채택: {accepted}개 ({accepted/total_wins*100:.1f}%)")
-            print(f"\n📈 [OOS 누적 성과]")
-            print(f"   최종 OOS 잔고: ${df_oos['oos_bal'].iloc[-1]:,.2f}  (시작: $100.00)")
-            print(f"   OOS 총 수익률: {df_oos['oos_bal'].iloc[-1] - 100:+.2f}%")
-            print(f"   OOS 최대 낙폭: {df_oos['oos_mdd_cumul'].max()*100:.2f}%")
-            print(f"\n📋 [윈도우별 요약]")
-            print(f"{'Win':>4} | {'Train ROI':>9} | {'Test ROI':>8} | {'MDD':>6} | {'채택':>4} | OOS잔고")
-            print("─" * 60)
-            for _, r in df_oos.iterrows():
-                flag = "✅" if r['is_accepted'] else "❌"
-                print(f"  {int(r['window']):2d}  | {r['train_roi']:+8.2f}%  | {r['test_roi']:+7.2f}%  | "
-                      f"{r['test_mdd']*100:5.1f}% | {flag}   | ${r['oos_bal']:,.2f}")
-        print(f"\n💾 전체 결과: {FILE_OOS}")
-        if os.path.exists(FILE_PARAMS):
-            print(f"💾 채택 파라미터: {FILE_PARAMS}")
-        print("="*60)
+        print(f"📂 윈도우 {win_idx} | 학습: {current_train_start.date()} ~ {train_end.date()} "
+              f"| 테스트: {train_end.date()} ~ {test_end.date()}")
+
+        df_train           = df_all[(df_all['ts'] >= current_train_start) & (df_all['ts'] < train_end)].copy()
+        best_params, top_k = run_ga(df_train)
+
+        if not best_params or best_params.get('Fitness', -1e9) <= -1000:
+            print("   ⚠️ 유효한 파라미터 없음 → 건너뜀")
+            current_train_start += pd.Timedelta(days=STEP_DAYS)
+            continue
+
+        all_candidates.extend(top_k)
+
+        train_roi = best_params['ROI']
+        print(f"   [학습-IS] ROI: {train_roi:.2f}% | "
+              f"MDD: {best_params['MDD'] * 100:.1f}% | Trades: {best_params['Trades']} "
+              f"| 클러스터 풀: {len(all_candidates)}개 "
+              f"| entry_tf: {best_params.get('entry_tf', 'N/A')}")
+
+        df_test     = df_all[(df_all['ts'] >= train_end) & (df_all['ts'] < test_end)].copy()
+        test_result = evaluate_on_df(best_params, df_test)
+        test_roi    = test_result['ROI']
+        test_mdd    = test_result['MDD']
+        test_trades = test_result['Trades']
+
+        test_windows.append((win_idx, current_train_start, train_end, test_end, df_test))
+
+        reason = []
+        if test_roi    < MIN_TEST_ROI:    reason.append(f"ROI {test_roi:.1f}% < {MIN_TEST_ROI}%")
+        if test_mdd    > MAX_TEST_MDD:    reason.append(f"MDD {test_mdd * 100:.1f}% > {MAX_TEST_MDD * 100:.0f}%")
+        if test_trades < MIN_TEST_TRADES: reason.append(f"거래 {test_trades}회 < {MIN_TEST_TRADES}회")
+
+        is_accepted = len(reason) == 0
+        status      = "✅ 채택" if is_accepted else f"❌ 기각 ({' / '.join(reason)})"
+        print(f"   [테스트] ROI: {test_roi:.2f}% | MDD: {test_mdd * 100:.1f}% | "
+              f"Trades: {test_trades} → {status}")
+
+        if test_trades > 0:
+            capped_roi = min(test_roi, BAL_CAP - 100.0)
+            oos_bal   *= max(1.0 + capped_roi / 100.0, 0.0)
+            if oos_bal > oos_peak: oos_peak = oos_bal
+            oos_mdd = max(oos_mdd, (oos_peak - oos_bal) / (oos_peak + 1e-9))
+
+        oos_row = pd.DataFrame([{
+            'window'       : win_idx,
+            'train_start'  : current_train_start.date(),
+            'train_end'    : train_end.date(),
+            'test_end'     : test_end.date(),
+            'train_roi'    : round(train_roi, 4),
+            'test_roi'     : round(test_roi, 4),
+            'test_mdd'     : round(test_mdd, 4),
+            'test_trades'  : test_trades,
+            'is_accepted'  : is_accepted,
+            'oos_bal'      : round(oos_bal, 4),
+            'oos_mdd_cumul': round(oos_mdd, 4),
+            'entry_tf'     : best_params.get('entry_tf', 'N/A'),  # v07: entry_tf 기록
+        }])
+        oos_row.to_csv(FILE_OOS, mode='a',
+                       header=not os.path.exists(FILE_OOS) or win_idx == 1,
+                       index=False, encoding='utf-8-sig')
+
+        if is_accepted:
+            param_row = best_params.copy()
+            param_row.update({
+                'win_idx'   : win_idx,
+                'train_roi' : round(train_roi, 4),
+                'test_roi'  : round(test_roi, 4),
+                'test_mdd'  : round(test_mdd, 4),
+                'start_date': current_train_start.date(),
+                'end_date'  : train_end.date(),
+            })
+            pd.DataFrame([param_row]).to_csv(
+                FILE_PARAMS, mode='a',
+                header=not os.path.exists(FILE_PARAMS),
+                index=False, encoding='utf-8-sig'
+            )
+
+        print(f"   💾 저장 → {FILE_OOS}" + (f" / {FILE_PARAMS}" if is_accepted else ""))
+        current_train_start += pd.Timedelta(days=STEP_DAYS)
+
+    # ─── Phase 2: 클러스터링 + OOS 재검증 ──────────
+    best_cluster_params = run_cluster_analysis(
+        all_candidates, test_windows,
+        FILE_CLUSTER, FILE_CLUSTER_BEST,
+    )
+
+    # ─── 최종 요약 ─────────────────────────────────
+    print(f"\n{'='*60}")
+    print("🏁 WFA v07 완료")
+
+    if os.path.exists(FILE_OOS):
+        df_oos     = pd.read_csv(FILE_OOS)
+        total_wins = int(df_oos['window'].max())
+        accepted   = int(df_oos['is_accepted'].sum())
+        print(f"\n[전통 WFA] 총 {total_wins}개 윈도우 | 채택: {accepted}개 "
+              f"({accepted / total_wins * 100:.1f}%)")
+        print(f"   최종 OOS 잔고: ${df_oos['oos_bal'].iloc[-1]:,.2f}  (시작: $100.00)")
+        print(f"   OOS 총 수익률: {df_oos['oos_bal'].iloc[-1] - 100:+.2f}%")
+        print(f"   OOS 최대 낙폭: {df_oos['oos_mdd_cumul'].max() * 100:.2f}%")
+
+        # entry_tf 선택 통계
+        if 'entry_tf' in df_oos.columns:
+            tf_counts = df_oos['entry_tf'].value_counts()
+            print(f"\n   [entry_tf 선택] {tf_counts.to_dict()}")
+
+        print(f"\n{'─'*60}")
+        header = f"{'Win':>4} | {'Train ROI':>9} | {'Test ROI':>8} | {'MDD':>6} | {'채택':>4} | {'TF':>3} | OOS잔고"
+        print(header)
+        print("─" * 65)
+        for _, r in df_oos.iterrows():
+            flag = "✅" if r['is_accepted'] else "❌"
+            tf_str = str(r.get('entry_tf', '?'))[:3]
+            print(f"  {int(r['window']):2d}  | {r['train_roi']:+8.2f}%  | {r['test_roi']:+7.2f}%  | "
+                  f"{r['test_mdd'] * 100:5.1f}% | {flag}   | {tf_str} | ${r['oos_bal']:,.2f}")
+
+    if best_cluster_params is not None:
+        print(f"\n[클러스터 WFA] 최우수 파라미터 세트")
+        print(f"   클러스터 {best_cluster_params['cluster_id']} "
+              f"(크기: {best_cluster_params['cluster_size']}개 후보)")
+        print(f"   전체 윈도우 평균 OOS ROI: {best_cluster_params['avg_oos_roi']:+.2f}%")
+        print(f"   OOS 승률: {best_cluster_params['oos_win_rate'] * 100:.0f}%")
+        print(f"   최대 OOS MDD: {best_cluster_params['max_oos_mdd'] * 100:.1f}%")
+        print(f"   Calmar: {best_cluster_params['calmar']:.3f}")
+        print(f"   누적 OOS 잔고: ${best_cluster_params['oos_final_bal']:,.2f}")
+        print(f"   entry_tf: {best_cluster_params.get('entry_tf', 'N/A')}")
+        print(f"   regime_thresh: {best_cluster_params.get('regime_thresh', 'N/A'):.4f}")
+
+    print(f"\n💾 파일 목록")
+    for f in [FILE_OOS, FILE_PARAMS, FILE_CLUSTER, FILE_CLUSTER_BEST]:
+        if os.path.exists(f):
+            print(f"   {f}")
+    print("=" * 60)
