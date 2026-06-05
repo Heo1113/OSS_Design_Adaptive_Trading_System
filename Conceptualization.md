@@ -7,6 +7,7 @@
 | :--- | :--- | :--- | :--- |
 | 2026-03-27 | 1.0.0 | Initial Draft | 허주호 |
 | 2026-03-28 | 1.1.0 | Add and edit content | 허주호 |
+| 2026-06-05 | 1.2.0 | Update reference to Java tech stack (ta4j) | 허주호 |
 ---
 
 ### 1. Business purpose
@@ -102,4 +103,4 @@
 ### 7. References
 
 * Binance API Documentation: https://binance-docs.github.io/apidocs/
-* Pandas-ta Library: https://github.com/twopirllc/pandas-ta (https://pypi.org/project/pandas-ta/ - 안 들어가질 시 참고 사항)
+* ta4j (Technical Analysis for Java): https://github.com/ta4j/ta4j
