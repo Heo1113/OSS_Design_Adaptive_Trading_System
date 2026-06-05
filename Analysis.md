@@ -6,6 +6,7 @@
 | Date | Version | Description | Author |
 | :--- | :--- | :--- | :--- |
 | 2026-05-08 | 1.0.0 | Initial Draft | 허주호 |
+| 2026-06-05 | 1.1.0 | Update reference to Java tech stack (ta4j) | 허주호 |
 
 ---
 
@@ -751,7 +752,7 @@ ATS는 백엔드 엔진 중심 시스템이지만, 사용자가 직관적으로 
 ## 6. References
 
 * [1] Binance API Documentation: https://binance-docs.github.io/apidocs/
-* [2] Pandas-ta Library: https://github.com/twopirllc/pandas-ta (https://pypi.org/project/pandas-ta/)
+* [2] ta4j (Technical Analysis for Java): https://github.com/ta4j/ta4j
 * [3] Bernd Bruegge, Allen H. Dutoit, *Object-Oriented Software Engineering: Using UML, Patterns, and Java*, 3rd edition, Pearson, 2010. (수업 main textbook)
 * [4] OMG, *Unified Modeling Language Specification (UML 2.5.1)*, Object Management Group, 2017.
 * [5] StarUML 공식 문서: https://docs.staruml.io/
